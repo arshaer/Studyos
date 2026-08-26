@@ -162,6 +162,23 @@ function uploadMimeType(file: File) {
   return "application/octet-stream";
 }
 
+function safeUploadName(name: string) {
+  const extension = name.match(/\.[a-z0-9]+$/i)?.[0] || "";
+  const stem = extension ? name.slice(0, -extension.length) : name;
+  const safeStem = stem.normalize("NFKD").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
+  return `${safeStem || "document"}${extension.toLowerCase()}`;
+}
+
+function uploadErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (/expected pattern|invalid url|failed to retrieve|client token|presigned url/i.test(message)) {
+    return "The secure upload could not be started. Refresh the page and try again. If it continues, sign out and back in.";
+  }
+  if (/network|fetch|load failed/i.test(message)) return "The upload lost its network connection. Check your connection and try again.";
+  if (/too large|size/i.test(message)) return "This file is larger than the 250 MB upload limit.";
+  return message || "The upload failed before it could be saved. Please try again.";
+}
+
 function statusLabel(status: string) {
   if (status === "ready") return "Ready for AI";
   if (status === "processing") return "Processing";
@@ -385,10 +402,15 @@ export default function StudyApp() {
     setSection("library");
     setUploadState({ status: "uploading", message: `${file.name} · ${formatBytes(file.size)}` });
     try {
-      const blob = await uploadBlob(`users/${userId}/documents/${file.name}`, file, {
+      // Supplying an absolute endpoint avoids Safari's native URL parser failure before
+      // the token request is sent. Multipart keeps the same flow suitable for large PDFs.
+      const handleUploadUrl = new URL("/api/documents/upload", window.location.origin).toString();
+      const blob = await uploadBlob(`users/${userId}/documents/${safeUploadName(file.name)}`, file, {
         access: "private",
-        handleUploadUrl: "/api/documents/upload",
+        handleUploadUrl,
         clientPayload: JSON.stringify({ userId }),
+        multipart: file.size >= 5 * 1024 * 1024,
+        contentType: mimeType,
       });
       setUploadState({ status: "saving", message: "Upload complete. Saving document metadata…" });
       const title = file.name.replace(/\.[^/.]+$/, "");
@@ -415,7 +437,8 @@ export default function StudyApp() {
       void loadProgress();
       setTimeout(() => setUploadState({status:"idle"}), 4000);
     } catch (error) {
-      setUploadState({ status: "error", message: error instanceof Error ? error.message : "Upload failed" });
+      console.error("document upload failed", error);
+      setUploadState({ status: "error", message: uploadErrorMessage(error) });
       void loadDocuments();
     }
   }

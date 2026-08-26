@@ -1,6 +1,5 @@
 import { get } from "@vercel/blob";
 import { OfficeParser } from "officeparser";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { db } from "@/lib-db";
 
 const CHUNK_CHARACTERS = 12_000;
@@ -21,6 +20,14 @@ function splitPart(part: ExtractedPart) {
 }
 
 async function extractPdf(bytes: Uint8Array): Promise<ExtractedPart[]> {
+  // pdfjs needs these globals even for text-only extraction. Making the native
+  // canvas package explicit prevents Vercel from pruning pdfjs' optional runtime.
+  if (!globalThis.DOMMatrix || !globalThis.Path2D) {
+    const canvas = await import("@napi-rs/canvas");
+    globalThis.DOMMatrix ??= canvas.DOMMatrix as unknown as typeof DOMMatrix;
+    globalThis.Path2D ??= canvas.Path2D as unknown as typeof Path2D;
+  }
+  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const pdf = await getDocument({ data: bytes }).promise;
   const pages: ExtractedPart[] = [];
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {

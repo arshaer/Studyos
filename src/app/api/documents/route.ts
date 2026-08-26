@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { db, ensureStudySchema } from "@/lib-db";
 import { processDocument } from "@/lib-document-processing";
 import { currentUserId } from "@/lib-user";
+import { head } from "@vercel/blob";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -52,8 +53,20 @@ export async function POST(request: Request) {
     if (!allowedMimeTypes.has(String(mimeType)) || Number(sizeBytes) > MAX_UPLOAD_BYTES) {
       return NextResponse.json({ error: "Unsupported file type or file is larger than 250 MB" }, { status: 400 });
     }
-    if (!String(pathname).startsWith(`users/${userId}/documents/`)) {
+    const ownedPrefix = `users/${userId}/documents/`;
+    if (!String(pathname).startsWith(ownedPrefix)) {
       return NextResponse.json({ error: "Upload ownership mismatch" }, { status: 403 });
+    }
+    // Never trust browser-supplied blob metadata. A private server lookup proves that
+    // the upload exists in this store before an owned database record is created.
+    const blob = await head(String(pathname));
+    if (!blob || blob.pathname !== pathname || !blob.url || blob.url !== fileUrl) {
+      return NextResponse.json({ error: "Uploaded file could not be verified" }, { status: 400 });
+    }
+    const verifiedMimeType = String(blob.contentType || mimeType);
+    const verifiedSizeBytes = Number(blob.size || 0);
+    if (!allowedMimeTypes.has(verifiedMimeType) || verifiedSizeBytes < 1 || verifiedSizeBytes > MAX_UPLOAD_BYTES) {
+      return NextResponse.json({ error: "Uploaded file type or size is not allowed" }, { status: 400 });
     }
     await ensureStudySchema();
     const sql = db();
@@ -61,7 +74,7 @@ export async function POST(request: Request) {
       insert into public.documents
         (user_id, title, original_name, file_url, pathname, mime_type, size_bytes, source_language, explanation_language, processing_status)
       values
-        (${userId}, ${title}, ${originalName}, ${fileUrl}, ${pathname}, ${mimeType}, ${sizeBytes}, ${sourceLanguage}, ${explanationLanguage}, 'uploaded')
+        (${userId}, ${title}, ${originalName}, ${blob.url}, ${blob.pathname}, ${verifiedMimeType}, ${verifiedSizeBytes}, ${sourceLanguage}, ${explanationLanguage}, 'uploaded')
       returning id, title, original_name, file_url, pathname, mime_type, size_bytes,
                 processing_status, processing_error, ai_status, ai_error, page_count,
                 source_language, explanation_language, created_at, updated_at
