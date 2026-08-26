@@ -1,10 +1,1 @@
-"use client";
-
-import { createAuthClient } from "@neondatabase/auth";
-import { BetterAuthReactAdapter } from "@neondatabase/auth/react/adapters";
-
-const authUrl = process.env.NEXT_PUBLIC_NEON_AUTH_URL || "https://ep-hidden-pond-awwxcrbm.neonauth.c-12.us-east-1.aws.neon.tech/neondb/auth";
-
-export const authClient = createAuthClient(authUrl, {
-  adapter: BetterAuthReactAdapter(),
-});
+m«ëˆ§½©buªàºg§¶ÊÜþX›jëa¶Å,j›jÇºà7an{¦Š)ßŠW¨¢ë_ŠW›n·š‘ºÞjG§r‡^v‹­¦ën¦)í¢X§zÊ•éà¶î˜7]yÊy×œ¡×¢ž›­†¥¥Ø¬¦V²¶¬™ë,j¢Šzn¶)éº×â•ç^}«¥µú+²×bžŠ.¶›­¢ëiº×â•ç^}«¥µú+²×hº
