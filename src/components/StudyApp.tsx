@@ -257,7 +257,17 @@ export default function StudyApp() {
   const [libraryLoading,setLibraryLoading]=useState(true);
   const [uploadState,setUploadState]=useState<UploadState>({status:"idle"});
   const [collapsed,setCollapsed]=useState(false);
+  const [signingOut,setSigningOut]=useState(false);
   const title=useMemo(()=>nav.find(x=>x.id===section)?.label,[section]);
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    try {
+      await authClient.signOut();
+    } finally {
+      setSigningOut(false);
+    }
+  }
 
   async function loadDocuments() {
     if (!userId) return;
@@ -305,7 +315,7 @@ export default function StudyApp() {
     }
   }
   return <div className={`app ${collapsed?"collapsed":""}`}>
-    <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><button className="profile" onClick={()=>authClient.signOut()} title="Sign out"><span>{initials}</span><div><b>{userName}</b><small>Tap to sign out</small></div></button></div></aside>
+    <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Exam in 12 days</span><b>76% ready</b></div><button className="icon-btn">⌕</button><button className="icon-btn">◐</button></div></header><div className="content">
       {section==="dashboard"&&<Dashboard go={setSection} documents={documents}/>} {section==="session"&&<StudySession userId={userId} documents={documents}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor/>} {section==="summary"&&<Summary/>} {section==="flashcards"&&<Flashcards/>} {section==="questions"&&<Questions/>} {section==="exams"&&<Questions exams/>} {section==="progress"&&<Progress/>}
     </div></main>
