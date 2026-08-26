@@ -68,11 +68,12 @@ export function ensureStudySchema() {
         create table if not exists public.ai_generations (
           id uuid primary key default gen_random_uuid(), user_id text not null,
           document_id uuid references public.documents(id) on delete set null,
-          mode text not null, model text not null, prompt text, response_json jsonb not null,
+          mode text not null, provider text not null default 'gemini', model text not null, prompt text, response_json jsonb not null,
           input_tokens int not null default 0, output_tokens int not null default 0,
           created_at timestamptz not null default now()
         )
       `;
+      await sql`alter table public.ai_generations add column if not exists provider text not null default 'openai'`;
       await sql`create index if not exists ai_generations_user_created_idx on public.ai_generations (user_id, created_at desc)`;
     })().catch((error) => {
       schemaReady = null;

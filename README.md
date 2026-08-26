@@ -9,7 +9,7 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 - Ten-card active-recall deck generation.
 - Eight-question multiple-choice practice and exam generation.
 - English, Italian, and Persian requests supported.
-- Generation history and token usage stored in Neon.
+- Generation history, provider/model, and token usage stored in Neon.
 - Per-account safeguard of 40 AI generations per day.
 - Source ownership is checked before every generation.
 
@@ -27,7 +27,11 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 - `NEON_AUTH_COOKIE_SECRET`
 - `DATABASE_URL`
 - `BLOB_READ_WRITE_TOKEN`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL` (optional; defaults to `gpt-5.6-luna`)
+- `GEMINI_API_KEY` (required for the default AI provider; server-side only)
+- `GEMINI_MODEL` (optional; defaults to `gemini-2.5-flash`)
+
+Gemini is the default and does not require `OPENAI_API_KEY`. Optional OpenAI support remains available by setting `AI_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL`.
+
+Existing databases are migrated automatically on the first request by adding the `ai_generations.provider` column. Existing rows are labeled `openai`; new rows record the provider and model actually used.
 
 AI processing currently accepts selected source files up to 20 MB. The general Library upload limit remains 60 MB.

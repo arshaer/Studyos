@@ -23,7 +23,7 @@ create table if not exists public.study_intervals (
 create table if not exists public.ai_generations (
   id uuid primary key default gen_random_uuid(), user_id text not null,
   document_id uuid references public.documents(id) on delete set null,
-  mode text not null, model text not null, prompt text, response_json jsonb not null,
+  mode text not null, provider text not null default 'gemini', model text not null, prompt text, response_json jsonb not null,
   input_tokens int not null default 0, output_tokens int not null default 0,
   created_at timestamptz not null default now()
 );
