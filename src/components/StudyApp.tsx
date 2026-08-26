@@ -389,7 +389,7 @@ export default function StudyApp() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not save document");
       setDocuments((current) => [data.document, ...current]);
-      setUploadState({ status: "processing", message: "Upload complete. Verifying the private source…" });
+      setUploadState({ status: "processing", message: "Extracting text, pages, and source-grounded AI chunks…" });
       const processingResponse = await fetch("/api/documents", {
         method: "PATCH",
         headers: { "content-type": "application/json" },
@@ -398,7 +398,7 @@ export default function StudyApp() {
       const processingData = await processingResponse.json();
       if (!processingResponse.ok) throw new Error(processingData.error || "Document processing failed");
       setDocuments(current => current.map(document => document.id === processingData.document.id ? processingData.document : document));
-      setUploadState({ status: "done", message: "Ready for AI." });
+      setUploadState({ status: "done", message: "Chunk index complete. Ready for AI." });
       void loadProgress();
       setTimeout(() => setUploadState({status:"idle"}), 4000);
     } catch (error) {

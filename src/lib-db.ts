@@ -41,6 +41,22 @@ export function ensureStudySchema() {
       await sql`alter table public.documents add column if not exists updated_at timestamptz not null default now()`;
       await sql`create index if not exists documents_user_created_idx on public.documents (user_id, created_at desc)`;
       await sql`
+        create table if not exists public.document_chunks (
+          id bigserial primary key,
+          document_id uuid not null references public.documents(id) on delete cascade,
+          user_id text not null,
+          chunk_index int not null,
+          content text not null,
+          page_start int,
+          page_end int,
+          section text,
+          char_count int not null,
+          created_at timestamptz not null default now(),
+          unique (document_id, chunk_index)
+        )
+      `;
+      await sql`create index if not exists document_chunks_owner_idx on public.document_chunks (user_id, document_id, chunk_index)`;
+      await sql`
         create table if not exists public.study_sessions (
           id uuid primary key default gen_random_uuid(),
           user_id text not null,

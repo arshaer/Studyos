@@ -12,6 +12,8 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 - Generation history, provider/model, and token usage stored in Neon.
 - Per-account safeguard of 40 AI generations per day.
 - Source ownership is checked before every generation.
+- Files are extracted once, split into source-labeled chunks, and indexed in Neon. Tutor, flashcards, and questions retrieve chunks instead of sending the original file to the model.
+- Entire-document summaries use hierarchical map-reduce summarization over all persisted chunks.
 
 ## Existing features preserved
 
@@ -35,4 +37,4 @@ Gemini is the default and does not require `OPENAI_API_KEY`. Optional OpenAI sup
 
 Existing databases are migrated automatically on the first request. Document processing/AI state columns and `ai_generations.provider` are added when missing; new generations record the provider and model actually used.
 
-The Library accepts files up to 250 MB through direct browser-to-Blob upload. A single synchronous Gemini AI action currently reads sources up to 50 MB; larger files remain safely stored in the Library and return a clear action error until asynchronous extraction is introduced.
+The Library accepts files up to 250 MB through direct browser-to-Blob upload. Processing extracts PDF/TXT/DOCX/PPTX content into `document_chunks`; AI actions read those chunks, so there is no separate 20 MB or 50 MB AI-source limit.

@@ -29,3 +29,17 @@ create table if not exists public.ai_generations (
   input_tokens int not null default 0, output_tokens int not null default 0,
   created_at timestamptz not null default now()
 );
+create table if not exists public.document_chunks (
+  id bigserial primary key,
+  document_id uuid not null references public.documents(id) on delete cascade,
+  user_id text not null,
+  chunk_index int not null,
+  content text not null,
+  page_start int,
+  page_end int,
+  section text,
+  char_count int not null,
+  created_at timestamptz not null default now(),
+  unique (document_id, chunk_index)
+);
+create index if not exists document_chunks_owner_idx on public.document_chunks (user_id, document_id, chunk_index);

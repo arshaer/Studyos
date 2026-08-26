@@ -1,7 +1,10 @@
-import { get } from "@vercel/blob";
 import { NextResponse } from "next/server";
 import { db, ensureStudySchema } from "@/lib-db";
+import { processDocument } from "@/lib-document-processing";
 import { currentUserId } from "@/lib-user";
+
+export const runtime = "nodejs";
+export const maxDuration = 300;
 
 const MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const allowedMimeTypes = new Set([
@@ -83,15 +86,12 @@ export async function PATCH(request: Request) {
     if (!allowedMimeTypes.has(String(document.mime_type)) || Number(document.size_bytes) > MAX_UPLOAD_BYTES) {
       throw new Error("Unsupported file type or file is larger than 250 MB");
     }
-    const blob = await get(String(document.pathname), { access: "private", useCache: false });
-    if (!blob?.stream) throw new Error("Uploaded file could not be opened");
-    await blob.stream.cancel();
+    await processDocument(documentId, userId);
     const ready = await sql`
-      update public.documents set processing_status='ready', processing_error=null, updated_at=now()
-      where id=${documentId} and user_id=${userId}
-      returning id, title, original_name, file_url, pathname, mime_type, size_bytes,
+      select id, title, original_name, file_url, pathname, mime_type, size_bytes,
                 processing_status, processing_error, ai_status, ai_error, page_count,
                 source_language, explanation_language, created_at, updated_at
+      from public.documents where id=${documentId} and user_id=${userId}
     `;
     return NextResponse.json({ document: ready[0] });
   } catch (error) {
