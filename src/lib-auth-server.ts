@@ -3,9 +3,14 @@ import "server-only";
 import { createHash } from "node:crypto";
 import { createNeonAuth } from "@neondatabase/auth/next/server";
 
-function required(name: "NEON_AUTH_BASE_URL") {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is not configured`);
+function authBaseUrl() {
+  // The Vercel/Neon integration has historically emitted both names. The
+  // public value is the endpoint the browser integration exposes and was
+  // verified for this production branch; prefer it if the two drift apart.
+  const value = (
+    process.env.NEXT_PUBLIC_NEON_AUTH_URL || process.env.NEON_AUTH_BASE_URL
+  )?.trim();
+  if (!value) throw new Error("Neon Auth URL is not configured");
   return value.replace(/\/$/, "");
 }
 
@@ -31,6 +36,6 @@ function cookieSecret() {
 }
 
 export const auth = createNeonAuth({
-  baseUrl: required("NEON_AUTH_BASE_URL"),
+  baseUrl: authBaseUrl(),
   cookies: { secret: cookieSecret() },
 });
