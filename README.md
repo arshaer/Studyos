@@ -14,6 +14,8 @@ Next.js study workspace with Neon Auth, Neon/Postgres metadata, private Vercel B
 
 ## Required Vercel environment variables
 - `NEXT_PUBLIC_NEON_AUTH_URL`
+- `NEON_AUTH_BASE_URL`
+- `NEON_AUTH_COOKIE_SECRET` (recommended: a stable random value of at least 32 characters; existing deployments fall back to a server-only derived secret)
 - `DATABASE_URL`
 - `BLOB_READ_WRITE_TOKEN`
 

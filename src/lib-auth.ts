@@ -1,10 +1,7 @@
 "use client";
 
-import { createAuthClient } from "@neondatabase/auth";
-import { BetterAuthReactAdapter } from "@neondatabase/auth/react/adapters";
+import { createAuthClient } from "@neondatabase/auth/next";
 
-const authUrl = process.env.NEXT_PUBLIC_NEON_AUTH_URL || "https://ep-hidden-pond-awwxcrbm.neonauth.c-12.us-east-1.aws.neon.tech/neondb/auth";
-
-export const authClient = createAuthClient(authUrl, {
-  adapter: BetterAuthReactAdapter(),
-});
+// The Next.js client intentionally talks to our same-origin /api/auth route.
+// The server route then proxies requests to Neon Auth and owns session cookies.
+export const authClient = createAuthClient();

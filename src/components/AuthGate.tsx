@@ -32,7 +32,8 @@ export default function AuthGate({ children }: { children: ReactNode }) {
         ? await authClient.signUp.email({ name: name.trim() || email.split("@")[0], email: email.trim(), password })
         : await authClient.signIn.email({ email: email.trim(), password });
       if (result?.error) setError(result.error.message || "Authentication failed.");
-    } catch {
+    } catch (cause) {
+      console.error("Neon Auth request failed", cause);
       setError("Could not connect to authentication. Please try again.");
     } finally {
       setBusy(false);
