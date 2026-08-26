@@ -40,7 +40,7 @@ export async function POST(request: Request) {
       insert into public.documents
         (user_id, title, original_name, file_url, pathname, mime_type, size_bytes, source_language, explanation_language, processing_status)
       values
-        (${userId}, ${title}, ${originalName}, ${fileUrl}, ${pathname}, ${mimeType}, ${sizeBytes}, ${sourceLanguage}, ${explanationLanguage}, 'uploaded')
+        (${userId}, ${title}, ${originalName}, ${fileUrl}, ${pathname}, ${mimeType}, ${sizeBytes}, ${sourceLanguage}, ${explanationLanguage}, 'ready')
       returning id, title, original_name, file_url, pathname, mime_type, size_bytes,
                 processing_status, page_count, source_language, explanation_language, created_at
     `;

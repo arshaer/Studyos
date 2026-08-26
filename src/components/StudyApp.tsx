@@ -20,6 +20,27 @@ type StudyDocument = {
 };
 
 type UploadState = { status: "idle" | "uploading" | "saving" | "done" | "error"; message?: string };
+type AiTextResult = { title: string; content: string; citations: string[]; followUps: string[] };
+type AiCard = { front: string; back: string; citation: string };
+type AiQuestion = { question: string; options: string[]; answer: string; explanation: string; citation: string };
+
+function DocumentSelect({ documents, value, onChange }: { documents: StudyDocument[]; value: string; onChange: (value: string) => void }) {
+  return <select value={value} onChange={event => onChange(event.target.value)}>
+    <option value="">Choose study material…</option>
+    {documents.map(document => <option key={document.id} value={document.id}>{document.title}</option>)}
+  </select>;
+}
+
+async function requestAi<T>(userId: string, mode: string, documentId: string, prompt: string) {
+  const response = await fetch("/api/ai", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-studyos-user-id": userId },
+    body: JSON.stringify({ mode, documentId, prompt }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "AI generation failed");
+  return data.result as T;
+}
 
 const nav: { id: Section; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌂" },
@@ -121,7 +142,7 @@ function formatBytes(value: number | string) {
 function statusLabel(status: string) {
   if (status === "ready") return "Ready for AI";
   if (status === "processing") return "Processing";
-  return "Uploaded · AI processing next";
+  return "Uploaded";
 }
 
 function Library({ documents, upload, state, loading }: { documents: StudyDocument[]; upload: (f: File) => void; state: UploadState; loading: boolean }) {
@@ -134,7 +155,7 @@ function Library({ documents, upload, state, loading }: { documents: StudyDocume
       {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {d.page_count ? `${d.page_count} pages · ` : ""}{new Date(d.created_at).toLocaleDateString()}</small></div><span className={`status ${d.processing_status === "ready" ? "good" : ""}`}>{statusLabel(d.processing_status)}</span></div>)}
     </div></div>
     {state.status === "error" && <div className="upload-error">{state.message}</div>}
-    <div className="panel pipeline"><b>AI processing pipeline</b><div className="pipeline-flow"><span className="done">Upload</span><i>→</i><span>Extract text</span><i>→</i><span>Detect sections</span><i>→</i><span>Create chunks</span><i>→</i><span>Source index</span><i>→</i><span>Ready for AI</span></div><small className="pipeline-note">File storage + Library are live now. Text extraction and AI indexing are the next build step.</small></div>
+    <div className="panel pipeline"><b>AI processing pipeline</b><div className="pipeline-flow"><span className="done">Upload</span><i>→</i><span className="done">Private source</span><i>→</i><span className="done">Grounded context</span><i>→</i><span className="done">Citations</span><i>→</i><span className="done">Ready for AI</span></div><small className="pipeline-note">Phase 4 reads the selected private source directly for Tutor, Summary, Flashcards, and Questions.</small></div>
   </>
 }
 
@@ -199,43 +220,63 @@ function StudySession({ userId, documents }: { userId: string; documents: StudyD
   </>
 }
 
-function Tutor() {
+function Tutor({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
   const [message,setMessage]=useState("");
-  const [log,setLog]=useState<string[]>([]);
+  const [documentId,setDocumentId]=useState(documents[0]?.id || "");
+  const [result,setResult]=useState<AiTextResult | null>(null);
+  const [loading,setLoading]=useState(false);
+  const [error,setError]=useState("");
+  async function ask(prompt=message) {
+    if (!documentId || !prompt.trim()) { setError("Choose a document and enter a question."); return; }
+    setLoading(true); setError("");
+    try { setResult(await requestAi<AiTextResult>(userId,"tutor",documentId,prompt)); setMessage(""); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "AI Tutor failed"); }
+    finally { setLoading(false); }
+  }
   return <>
-    <PageTitle kicker="ACTIVE LEARNING" title="AI Tutor" text="A source-grounded tutor that teaches the notes step by step instead of merely summarizing them." />
+    <PageTitle kicker="ACTIVE LEARNING" title="AI Tutor" text="Ask questions grounded only in your uploaded study material, with source references." />
     <div className="tutor-grid"><div className="panel lesson-panel">
-      <div className="lesson-head"><div><span>Pharmacology · Drug Metabolism</span><h3>CYP450 system</h3></div><div className="mini-progress"><span>Lesson 4 / 7</span><b>58%</b></div></div>
-      <div className="lesson-body"><span className="ai-badge">AI TUTOR</span><h2>Let’s build the mechanism from the beginning.</h2><p>Cytochrome P450 enzymes are a superfamily of heme-containing monooxygenases. In your uploaded notes, this section connects drug oxidation with NADPH, molecular oxygen and the catalytic heme group.</p><div className="concept-box"><b>Core mechanism</b><ol><li>Substrate binds near the heme iron.</li><li>Electrons are transferred from NADPH.</li><li>Molecular oxygen is activated.</li><li>One oxygen atom is incorporated into the substrate.</li><li>The second oxygen atom becomes water.</li></ol></div><div className="source-chip">Source · General Pharmacology.pdf · p. 37–39</div>
-      {log.map((m,i)=><div className="user-msg" key={i}>{m}</div>)}</div>
-      <div className="quick-actions">{["Explain more simply","Go deeper","Give an example","Ask me a question","Compare concepts"].map(x=><button key={x} onClick={()=>setLog(v=>[...v,x])}>{x}</button>)}</div>
-      <form className="chat-box" onSubmit={e=>{e.preventDefault();if(message.trim()){setLog(v=>[...v,message]);setMessage("")}}}><input value={message} onChange={e=>setMessage(e.target.value)} placeholder="Ask about this part of your notes…"/><button>↑</button></form>
-    </div><div className="panel tutor-side"><b>Lesson progress</b><div className="ring" style={{"--p":"58%"} as React.CSSProperties}><span>58%</span></div><div className="topic-list"><div><span>Introduction</span><b>100%</b></div><div><span>Heme group</span><b>100%</b></div><div><span>NADPH transfer</span><b>78%</b></div><div className="active"><span>Oxygen activation</span><b>58%</b></div><div><span>Phase I reactions</span><b>32%</b></div></div></div></div>
+      <div className="ai-source-row"><label>Source<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><span className="ai-badge">SOURCE-GROUNDED</span></div>
+      <div className="lesson-body ai-output">{!result && !loading && <div className="ai-empty"><b>Ask your first question</b><span>StudyOS will answer using only the selected file.</span></div>}{loading && <div className="ai-loading">Reading your material and preparing an answer…</div>}{result && <><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
+      {result && <div className="quick-actions">{result.followUps.map(item=><button key={item} onClick={()=>void ask(item)}>{item}</button>)}</div>}
+      {error && <div className="upload-error">{error}</div>}
+      <form className="chat-box" onSubmit={event=>{event.preventDefault();void ask();}}><input value={message} onChange={event=>setMessage(event.target.value)} placeholder="Ask about your notes…"/><button disabled={loading}>↑</button></form>
+    </div><div className="panel tutor-side"><b>How grounding works</b><div className="grounding-steps"><span>1</span><p><b>Select a source</b>Your private document is loaded securely.</p><span>2</span><p><b>Ask naturally</b>Use English, Italian, or Persian.</p><span>3</span><p><b>Verify citations</b>Answers identify their source location.</p></div><small>Daily safeguard · up to 40 AI generations per account.</small></div></div>
   </>
 }
 
-function Summary() { return <>
+function Summary({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
+  const [documentId,setDocumentId]=useState(documents[0]?.id || "");
+  const [depth,setDepth]=useState("Detailed");
+  const [result,setResult]=useState<AiTextResult | null>(null);
+  const [loading,setLoading]=useState(false); const [error,setError]=useState("");
+  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>(userId,"summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);} }
+  return <>
   <PageTitle kicker="SOURCE-GROUNDED" title="AI Summary" text="Generate revision notes at the depth you need without losing the structure of the original material." />
-  <div className="summary-controls panel"><label>Material<select><option>General Pharmacology.pdf</option></select></label><label>Coverage<select><option>CYP450 · pages 37–44</option><option>Entire document</option></select></label><label>Depth<select><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary">Generate summary</button></div>
-  <div className="panel article"><div className="article-top"><span>DETAILED SUMMARY</span><span>Source: p. 37–44</span></div><h2>Cytochrome P450 and Phase I metabolism</h2><p>Cytochrome P450 enzymes catalyze oxidation reactions that typically increase the polarity of lipophilic compounds and prepare them for subsequent elimination or conjugation.</p><h3>1. Catalytic components</h3><div className="definition-grid"><div><b>CYP enzyme</b><span>Heme-containing monooxygenase</span></div><div><b>Electron source</b><span>NADPH</span></div><div><b>Oxidant</b><span>Molecular oxygen</span></div></div><h3>2. High-yield mechanism</h3><p>The substrate binds close to the heme group. Electrons ultimately originating from NADPH allow activation of oxygen. One atom is incorporated into the substrate while the second is reduced to water.</p><div className="high-yield"><b>High-yield exam point</b><span>The P450 reaction is a monooxygenation: one oxygen atom enters the substrate, the other forms H₂O.</span></div></div>
+  <div className="summary-controls panel"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Coverage<select><option>Entire document</option></select></label><label>Depth<select value={depth} onChange={event=>setDepth(event.target.value)}><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate summary"}</button></div>
+  {error&&<div className="upload-error">{error}</div>}
+  <div className="panel article ai-output">{!result&&!loading&&<div className="ai-empty"><b>No summary generated yet</b><span>Select a document and choose the depth.</span></div>}{loading&&<div className="ai-loading">Building your source-grounded summary…</div>}{result&&<><div className="article-top"><span>{depth.toUpperCase()} SUMMARY</span><span>{result.citations.length} source references</span></div><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
   </> }
 
-function Flashcards() {
+function Flashcards({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
   const [index,setIndex]=useState(0); const [flip,setFlip]=useState(false);
-  const cards=[
-    ["What is the role of NADPH in CYP450 reactions?","It provides reducing equivalents/electrons required for the catalytic cycle."],
-    ["Why is CYP450 called a monooxygenase?","Because one oxygen atom is inserted into the substrate while the second is reduced to water."],
-    ["Where is the catalytic iron located?","Inside the heme group of the CYP enzyme."],
-  ];
-  return <><PageTitle kicker="SPACED REPETITION" title="Flashcards" text="Cards generated from your own notes and prioritized by memory strength." /><div className="flash-layout"><div className="panel deck-info"><b>CYP450 · Generated deck</b><div className="deck-stats"><span><strong>42</strong>Due</span><span><strong>87%</strong>Retention</span><span><strong>12</strong>Difficult</span></div><div className="meter"><span style={{width:"68%"}}/></div><small>34 / 50 reviewed today</small></div><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>CONCEPT · MEDIUM</span><span>{index+1} / {cards.length}</span></div><h2>{flip?cards[index][1]:cards[index][0]}</h2><span className="tap-hint">{flip?"Rate your recall":"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></div></>
+  const [documentId,setDocumentId]=useState(documents[0]?.id||""); const [cards,setCards]=useState<AiCard[]>([]);
+  const [title,setTitle]=useState("Generated deck"); const [loading,setLoading]=useState(false); const [error,setError]=useState("");
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>(userId,"flashcards",documentId,"Focus on high-yield concepts and common misconceptions.");setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);}}
+  const card=cards[index];
+  return <><PageTitle kicker="ACTIVE RECALL" title="Flashcards" text="Generate source-grounded cards directly from your own notes." /><div className="flash-layout"><div className="panel deck-info"><b>{title}</b><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate 10 cards"}</button><small>{cards.length?`${cards.length} cards ready`:`Select a source to create a deck.`}</small></div>{error&&<div className="upload-error">{error}</div>}{card?<><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>SOURCE-GROUNDED</span><span>{index+1} / {cards.length}</span></div><h2>{flip?card.back:card.front}</h2><span className="tap-hint">{flip?card.citation:"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></>:<div className="panel ai-empty"><b>No cards yet</b><span>Generate a new deck from an uploaded document.</span></div>}</div></>
 }
 
-function Questions({ exams=false }: { exams?: boolean }) {
-  const [submitted,setSubmitted]=useState(false); const [answer,setAnswer]=useState("");
+function Questions({ userId, documents, exams=false }: { userId: string; documents: StudyDocument[]; exams?: boolean }) {
+  const [submitted,setSubmitted]=useState(false); const [answer,setAnswer]=useState(""); const [index,setIndex]=useState(0);
+  const [documentId,setDocumentId]=useState(documents[0]?.id||""); const [questions,setQuestions]=useState<AiQuestion[]>([]);
+  const [loading,setLoading]=useState(false); const [error,setError]=useState("");
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>(userId,"questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.");setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);}}
+  const question=questions[index];
   return <><PageTitle kicker={exams?"SIMULATION":"ACTIVE RECALL"} title={exams?"Exam Simulator":"Questions"} text={exams?"Simulate the real exam and measure readiness by topic.":"Upload existing question banks or generate questions directly from selected study material."} />
-  {!exams && <div className="mode-cards"><div className="panel mode-card"><span>↑</span><b>Upload question file</b><p>Import PDF, DOCX, TXT or image-based question banks.</p><button>Upload questions</button></div><div className="panel mode-card"><span>✦</span><b>Generate with AI</b><p>Create source-grounded questions from your selected notes.</p><button>Configure generator</button></div></div>}
-  <div className="panel exam-builder"><div className="builder-row"><label>Exam type<select><option>Multiple Choice</option><option>True / False</option><option>Short Answer</option><option>Open-Ended Written</option><option>Oral Exam</option><option>Mixed Exam</option></select></label><label>Difficulty<select><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></label><label>Questions<select><option>10</option><option>20</option><option>30</option><option>50</option></select></label><label>Coverage<select><option>CYP450</option><option>Entire document</option></select></label></div></div>
-  <div className="panel question-card"><div className="question-top"><span>QUESTION 1 OF 10</span><span>Pharmacology · CYP450</span></div><h2>Which statement best describes the role of molecular oxygen in the CYP450 catalytic cycle?</h2>{["Both oxygen atoms are incorporated into the substrate.","One oxygen atom enters the substrate and one forms water.","Oxygen acts only as an electron donor.","Oxygen is not required when NADPH is present."].map((x,i)=><label className={`option ${answer===x?"selected":""}`} key={x}><input type="radio" name="q" value={x} checked={answer===x} onChange={()=>setAnswer(x)}/><span>{String.fromCharCode(65+i)}</span>{x}</label>)}<div className="question-footer"><button className="ghost">Flag question</button><button className="primary" onClick={()=>setSubmitted(true)}>Check answer</button></div>{submitted&&<div className={`result ${answer.includes("One oxygen")?"correct":"wrong"}`}><b>{answer.includes("One oxygen")?"Correct":"Review this concept"}</b><span>One oxygen atom is incorporated into the substrate while the other is reduced to water.</span><small>Source · General Pharmacology.pdf · p. 39</small></div>}</div></>
+  <div className="panel exam-builder"><div className="builder-row"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Type<select><option>Multiple Choice</option></select></label><label>Difficulty<select><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":exams?"Build exam":"Generate questions"}</button></div></div>
+  {error&&<div className="upload-error">{error}</div>}
+  {question?<div className="panel question-card"><div className="question-top"><span>QUESTION {index+1} OF {questions.length}</span><span>SOURCE-GROUNDED</span></div><h2>{question.question}</h2>{question.options.map((option,i)=><label className={`option ${answer===option?"selected":""}`} key={option}><input type="radio" name="q" value={option} checked={answer===option} onChange={()=>setAnswer(option)}/><span>{String.fromCharCode(65+i)}</span>{option}</label>)}<div className="question-footer"><button className="ghost" disabled={index===0} onClick={()=>{setIndex(index-1);setSubmitted(false);setAnswer("");}}>Previous</button><button className="primary" disabled={!answer} onClick={()=>setSubmitted(true)}>Check answer</button></div>{submitted&&<div className={`result ${answer===question.answer?"correct":"wrong"}`}><b>{answer===question.answer?"Correct":"Review this concept"}</b><span>{question.explanation}</span><small>{question.citation}</small><button className="ghost" disabled={index>=questions.length-1} onClick={()=>{setIndex(index+1);setSubmitted(false);setAnswer("");}}>Next question</button></div>}</div>:<div className="panel ai-empty"><b>No questions generated yet</b><span>Choose a document to build a source-grounded practice set.</span></div>}</>
 }
 
 function Progress() {
@@ -308,7 +349,7 @@ export default function StudyApp() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not save document");
       setDocuments((current) => [data.document, ...current]);
-      setUploadState({ status: "done", message: "Uploaded successfully. Ready for the AI processing step." });
+      setUploadState({ status: "done", message: "Uploaded successfully. Ready for AI study tools." });
       setTimeout(() => setUploadState({status:"idle"}), 4000);
     } catch (error) {
       setUploadState({ status: "error", message: error instanceof Error ? error.message : "Upload failed" });
@@ -317,7 +358,7 @@ export default function StudyApp() {
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Exam in 12 days</span><b>76% ready</b></div><button className="icon-btn">⌕</button><button className="icon-btn">◐</button></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents}/>} {section==="session"&&<StudySession userId={userId} documents={documents}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor/>} {section==="summary"&&<Summary/>} {section==="flashcards"&&<Flashcards/>} {section==="questions"&&<Questions/>} {section==="exams"&&<Questions exams/>} {section==="progress"&&<Progress/>}
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents}/>} {section==="session"&&<StudySession userId={userId} documents={documents}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor userId={userId} documents={documents}/>} {section==="summary"&&<Summary userId={userId} documents={documents}/>} {section==="flashcards"&&<Flashcards userId={userId} documents={documents}/>} {section==="questions"&&<Questions userId={userId} documents={documents}/>} {section==="exams"&&<Questions userId={userId} documents={documents} exams/>} {section==="progress"&&<Progress/>}
     </div></main>
   </div>
 }
