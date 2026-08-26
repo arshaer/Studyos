@@ -20,12 +20,18 @@ export async function GET(request: Request) {
     await ensureStudySchema();
     const sql = db();
     const rows = await sql`
-      select id, title, original_name, file_url, pathname, mime_type, size_bytes,
-             processing_status, processing_error, ai_status, ai_error, page_count,
-             source_language, explanation_language, created_at, updated_at
-      from public.documents
-      where user_id = ${userId}
-      order by created_at desc
+      select d.id, d.title, d.original_name, d.file_url, d.pathname, d.mime_type, d.size_bytes,
+             d.processing_status, d.processing_error, d.ai_status, d.ai_error, d.page_count,
+             d.source_language, d.explanation_language, d.created_at, d.updated_at,
+             coalesce(r.current_page, 1) as current_page,
+             coalesce(r.total_pages, d.page_count, 1) as total_pages,
+             coalesce(r.percent_complete, 0) as percent_complete,
+             coalesce(r.reading_seconds, 0) as reading_seconds,
+             r.last_opened_at
+      from public.documents d
+      left join public.document_reading_progress r on r.document_id=d.id and r.user_id=d.user_id
+      where d.user_id = ${userId}
+      order by d.created_at desc
     `;
     return NextResponse.json({ documents: rows });
   } catch (error) {

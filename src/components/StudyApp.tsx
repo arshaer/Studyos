@@ -2,7 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { upload as uploadBlob } from "@vercel/blob/client";
+import dynamic from "next/dynamic";
 import { authClient } from "@/lib-auth";
+
+const PdfReader = dynamic(() => import("@/components/PdfReader"), { ssr: false });
 
 type Section = "dashboard" | "session" | "library" | "tutor" | "summary" | "flashcards" | "questions" | "exams" | "progress";
 
@@ -19,6 +22,11 @@ type StudyDocument = {
   ai_status: "idle" | "generating" | "completed" | "error";
   ai_error?: string | null;
   page_count?: number | null;
+  current_page?: number | string;
+  total_pages?: number | string;
+  percent_complete?: number | string;
+  reading_seconds?: number | string;
+  last_opened_at?: string | null;
   created_at: string;
 };
 
@@ -30,11 +38,13 @@ type ProgressData = {
   documents: { total: number; ready: number };
   sessions: { total: number; focused_seconds: number | string; cycles: number };
   generations: { total: number; tutor: number; summaries: number; flashcards: number; questions: number };
+  reading: { reading_seconds: number | string; completed_documents: number; average_percent: number | string };
 };
 const EMPTY_PROGRESS: ProgressData = {
   documents: { total: 0, ready: 0 },
   sessions: { total: 0, focused_seconds: 0, cycles: 0 },
   generations: { total: 0, tutor: 0, summaries: 0, flashcards: 0, questions: 0 },
+  reading: { reading_seconds: 0, completed_documents: 0, average_percent: 0 },
 };
 
 function useReadyDocumentId(documents: StudyDocument[]) {
@@ -102,8 +112,9 @@ function UploadCard({ onUpload, state }: { onUpload: (f: File) => void; state: U
   );
 }
 
-function Dashboard({ go, documents, progress }: { go: (s: Section) => void; documents: StudyDocument[]; progress: ProgressData }) {
+function Dashboard({ go, documents, progress, openPdf }: { go: (s: Section) => void; documents: StudyDocument[]; progress: ProgressData; openPdf: (document: StudyDocument) => void }) {
   const focusedMinutes = Math.floor(Number(progress.sessions.focused_seconds || 0) / 60);
+  const readingMinutes = Math.floor(Number(progress.reading?.reading_seconds || 0) / 60);
   return (
     <>
       <div className="hero-row">
@@ -113,7 +124,7 @@ function Dashboard({ go, documents, progress }: { go: (s: Section) => void; docu
       <div className="metrics-grid">
         <Metric label="Documents" value={progress.documents.total} hint={`${progress.documents.ready} ready for AI`} />
         <Metric label="Study sessions" value={progress.sessions.total} hint={`${progress.sessions.cycles} focus cycles`} />
-        <Metric label="Focused time" value={focusedMinutes} suffix=" min" hint="Recorded from real sessions" />
+        <Metric label="Study time" value={focusedMinutes + readingMinutes} suffix=" min" hint={`${readingMinutes} min reading PDFs`} />
         <Metric label="AI generations" value={progress.generations.total} hint="Tutor and study tools" />
       </div>
       <div className="dashboard-grid">
@@ -128,7 +139,7 @@ function Dashboard({ go, documents, progress }: { go: (s: Section) => void; docu
         <div className="panel">
           <div className="panel-head"><div><b>Recent material</b><span>{documents.length ? `${documents.length} uploaded` : "Your active library"}</span></div><button onClick={() => go("library")}>Open library</button></div>
           {documents.length === 0 && <div className="empty-row">Upload your first document to start building your knowledge base.</div>}
-          {documents.slice(0,3).map((d) => <div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {statusLabel(d.processing_status)}</small></div><span className={`status ${d.processing_status === "ready" ? "good" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div>)}
+          {documents.slice(0,3).map((d) => <div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {d.mime_type === "application/pdf" ? `${Math.round(Number(d.percent_complete || 0))}% read · page ${Number(d.current_page || 1)}` : statusLabel(d.processing_status)}</small></div>{d.mime_type === "application/pdf" ? <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) ? "Resume" : "Read"}</button> : <span className={`status ${d.processing_status === "ready" ? "good" : ""}`}>{aiStatusLabel(d.ai_status)}</span>}</div>)}
         </div>
       </div>
     </>
@@ -165,14 +176,14 @@ function aiStatusLabel(status: StudyDocument["ai_status"]) {
   return "No AI actions yet";
 }
 
-function Library({ documents, upload, state, loading }: { documents: StudyDocument[]; upload: (f: File) => void; state: UploadState; loading: boolean }) {
+function Library({ documents, upload, state, loading, openPdf }: { documents: StudyDocument[]; upload: (f: File) => void; state: UploadState; loading: boolean; openPdf: (document: StudyDocument) => void }) {
   return <>
     <PageTitle kicker="KNOWLEDGE BASE" title="Study Library" text="Upload course material once. Every AI study mode will use it as the primary source of truth." />
     <div className="library-layout"><UploadCard onUpload={upload} state={state} /><div className="panel file-list">
       <div className="panel-head"><div><b>Your material</b><span>{documents.length} document{documents.length === 1 ? "" : "s"} in your private library</span></div></div>
       {loading && <div className="library-empty">Loading your library…</div>}
       {!loading && documents.length === 0 && <div className="library-empty"><b>No study material yet.</b><span>Upload a PDF and it will appear here permanently under your account.</span></div>}
-      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small></div><div className="state-stack"><span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
+      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small>{d.mime_type === "application/pdf" && <div className="document-reading"><span><i style={{width:`${Math.min(100,Number(d.percent_complete || 0))}%`}}/></span><b>{Math.round(Number(d.percent_complete || 0))}% · Continue page {Number(d.current_page || 1)}</b></div>}</div><div className="state-stack">{d.mime_type === "application/pdf" && <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) > 0 ? "Continue reading" : "Read PDF"}</button>}<span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
     </div></div>
     {state.status === "error" && <div className="upload-error">{state.message}</div>}
     <div className="panel pipeline"><b>Document and AI states</b><div className="pipeline-flow"><span>Uploaded</span><i>→</i><span>Processing</span><i>→</i><span>Ready for AI</span><i>→</i><span>Generating</span><i>→</i><span>Completed / Error</span></div><small className="pipeline-note">Uploads go directly from your browser to private Vercel Blob storage. Access and ownership are verified on the server.</small></div>
@@ -303,8 +314,9 @@ function Questions({ documents, exams=false, onStatusChange }: { documents: Stud
 
 function Progress({ progress }: { progress: ProgressData }) {
   const focusedMinutes = Math.floor(Number(progress.sessions.focused_seconds || 0) / 60);
+  const readingMinutes = Math.floor(Number(progress.reading?.reading_seconds || 0) / 60);
   return <><PageTitle kicker="MEASURABLE LEARNING" title="Progress & Analytics" text="Every number below comes from your saved StudyOS activity." />
-  <div className="metrics-grid"><Metric label="Documents" value={progress.documents.total}/><Metric label="Focused minutes" value={focusedMinutes}/><Metric label="Completed cycles" value={progress.sessions.cycles}/><Metric label="AI generations" value={progress.generations.total}/></div>
+  <div className="metrics-grid"><Metric label="Documents" value={progress.documents.total}/><Metric label="Focused minutes" value={focusedMinutes}/><Metric label="PDF reading" value={readingMinutes} suffix=" min"/><Metric label="Average read" value={Math.round(Number(progress.reading?.average_percent || 0))} suffix="%"/></div>
   <div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>AI activity</b><span>Generated from your own documents</span></div></div><div className="real-counts"><span><b>{progress.generations.tutor}</b>Tutor answers</span><span><b>{progress.generations.summaries}</b>Summaries</span><span><b>{progress.generations.flashcards}</b>Flashcard decks</span><span><b>{progress.generations.questions}</b>Question sets</span></div></div><div className="panel empty-dashboard"><div className="section-kicker">YOUR ACTIVITY</div><h3>{progress.generations.total || progress.sessions.total ? "Your real activity is recorded" : "Your progress starts at zero"}</h3><p>StudyOS adds progress only after you study or generate content.</p></div></div></>
 }
 
@@ -320,6 +332,7 @@ export default function StudyApp() {
   const [uploadState,setUploadState]=useState<UploadState>({status:"idle"});
   const [collapsed,setCollapsed]=useState(false);
   const [signingOut,setSigningOut]=useState(false);
+  const [readerDocument,setReaderDocument]=useState<StudyDocument | null>(null);
   const title=useMemo(()=>nav.find(x=>x.id===section)?.label,[section]);
 
   async function handleSignOut() {
@@ -409,7 +422,8 @@ export default function StudyApp() {
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Your private workspace</span><b>{progress.documents.ready} AI-ready</b></div></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
     </div></main>
+    {readerDocument && <PdfReader document={readerDocument} onClose={() => { setReaderDocument(null); void Promise.all([loadDocuments(), loadProgress()]); }} onProgress={() => void Promise.all([loadDocuments(), loadProgress()])}/>}
   </div>
 }

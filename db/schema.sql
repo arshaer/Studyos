@@ -43,3 +43,15 @@ create table if not exists public.document_chunks (
   unique (document_id, chunk_index)
 );
 create index if not exists document_chunks_owner_idx on public.document_chunks (user_id, document_id, chunk_index);
+create table if not exists public.document_reading_progress (
+  user_id text not null,
+  document_id uuid not null references public.documents(id) on delete cascade,
+  current_page int not null default 1,
+  total_pages int not null default 1,
+  percent_complete numeric(5,2) not null default 0,
+  reading_seconds int not null default 0,
+  last_opened_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, document_id)
+);
+create index if not exists document_reading_progress_recent_idx on public.document_reading_progress (user_id, last_opened_at desc);
