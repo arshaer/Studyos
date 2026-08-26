@@ -1,1 +1,7 @@
-m«ëˆ§½©buªàºg§¶ÊÜþX›jëa¶Å,j›jÇºà7an{¦Š)ßŠW¨¢ë_ŠW›n·š‘ºÞjG§r‡^v‹­¦ën¦)í¢X§zÊ•éà¶î˜7]yÊy×œ¡×¢ž›­†¥¥Ø¬¦V²¶¬™ë,j¢Šzn¶)éº×â•ç^}«¥µú+²×bžŠ.¶›­¢ëiº×â•ç^}«¥µú+²×hº
+"use client";
+
+import { createAuthClient } from "@neondatabase/auth/next";
+
+// The Next.js client intentionally talks to our same-origin /api/auth route.
+// The server route then proxies requests to Neon Auth and owns session cookies.
+export const authClient = createAuthClient();
