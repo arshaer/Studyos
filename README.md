@@ -16,7 +16,8 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 ## Existing features preserved
 
 - Email/password authentication through Neon Auth.
-- Private PDF, DOCX, PPTX, and TXT uploads up to 60 MB.
+- Direct-to-private-Blob PDF, DOCX, PPTX, and TXT uploads up to 250 MB.
+- Explicit document states: Uploaded, Processing, and Ready for AI; AI actions record Generating, Completed, or Error.
 - Persistent Library metadata and Pomodoro study sessions.
 - Responsive dashboard, Progress, Questions, Exams, and account controls.
 
@@ -32,6 +33,6 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 
 Gemini is the default and does not require `OPENAI_API_KEY`. Optional OpenAI support remains available by setting `AI_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL`.
 
-Existing databases are migrated automatically on the first request by adding the `ai_generations.provider` column. Existing rows are labeled `openai`; new rows record the provider and model actually used.
+Existing databases are migrated automatically on the first request. Document processing/AI state columns and `ai_generations.provider` are added when missing; new generations record the provider and model actually used.
 
-AI processing currently accepts selected source files up to 20 MB. The general Library upload limit remains 60 MB.
+The Library accepts files up to 250 MB through direct browser-to-Blob upload. A single synchronous Gemini AI action currently reads sources up to 50 MB; larger files remain safely stored in the Library and return a clear action error until asynchronous extraction is introduced.

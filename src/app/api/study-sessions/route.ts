@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { db, ensureStudySchema } from "@/lib-db";
+import { currentUserId } from "@/lib-user";
 
-function uid(request: Request) { return request.headers.get("x-studyos-user-id")?.trim() || ""; }
-
-export async function GET(request: Request) {
+export async function GET() {
   try {
-    const userId = uid(request);
+    const userId = await currentUserId();
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     await ensureStudySchema();
     const sql = db();
@@ -22,16 +21,19 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const userId = uid(request);
+    const userId = await currentUserId();
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     const body = await request.json();
     await ensureStudySchema();
     const sql = db();
     if (body.action === "interval") {
-      await sql`
+      const intervals = await sql`
         insert into public.study_intervals (session_id, user_id, interval_type, planned_seconds, actual_seconds, completed)
-        values (${body.sessionId}, ${userId}, ${body.intervalType}, ${body.plannedSeconds}, ${body.actualSeconds}, ${body.completed !== false})
+        select id, ${userId}, ${body.intervalType}, ${body.plannedSeconds}, ${body.actualSeconds}, ${body.completed !== false}
+        from public.study_sessions where id=${body.sessionId} and user_id=${userId}
+        returning id
       `;
+      if (!intervals[0]) return NextResponse.json({ error: "Study session not found" }, { status: 404 });
       if (body.intervalType === "focus") {
         await sql`update public.study_sessions set focused_seconds=focused_seconds+${body.actualSeconds}, completed_cycles=completed_cycles+1 where id=${body.sessionId} and user_id=${userId}`;
       } else {
@@ -42,6 +44,10 @@ export async function POST(request: Request) {
     if (body.action === "finish") {
       await sql`update public.study_sessions set status='completed', ended_at=now() where id=${body.sessionId} and user_id=${userId}`;
       return NextResponse.json({ ok: true });
+    }
+    if (body.documentId) {
+      const owned = await sql`select id from public.documents where id=${body.documentId} and user_id=${userId} limit 1`;
+      if (!owned[0]) return NextResponse.json({ error: "Document not found" }, { status: 404 });
     }
     const rows = await sql`
       insert into public.study_sessions (user_id, document_id, title, mode, focus_minutes, break_minutes, target_cycles)

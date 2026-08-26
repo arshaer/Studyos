@@ -28,9 +28,17 @@ export function ensureStudySchema() {
           source_language text not null default 'it',
           explanation_language text not null default 'it',
           processing_status text not null default 'uploaded',
+          processing_error text,
+          ai_status text not null default 'idle',
+          ai_error text,
+          updated_at timestamptz not null default now(),
           created_at timestamptz not null default now()
         )
       `;
+      await sql`alter table public.documents add column if not exists processing_error text`;
+      await sql`alter table public.documents add column if not exists ai_status text not null default 'idle'`;
+      await sql`alter table public.documents add column if not exists ai_error text`;
+      await sql`alter table public.documents add column if not exists updated_at timestamptz not null default now()`;
       await sql`create index if not exists documents_user_created_idx on public.documents (user_id, created_at desc)`;
       await sql`
         create table if not exists public.study_sessions (

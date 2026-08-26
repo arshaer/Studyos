@@ -6,7 +6,9 @@ create table if not exists public.documents (
   title text not null, original_name text not null, file_url text not null, pathname text not null,
   mime_type text not null, size_bytes bigint not null default 0, page_count int,
   source_language text not null default 'it', explanation_language text not null default 'it',
-  processing_status text not null default 'uploaded', created_at timestamptz not null default now()
+  processing_status text not null default 'uploaded', processing_error text,
+  ai_status text not null default 'idle', ai_error text,
+  updated_at timestamptz not null default now(), created_at timestamptz not null default now()
 );
 create table if not exists public.study_sessions (
   id uuid primary key default gen_random_uuid(), user_id text not null, document_id uuid references public.documents(id) on delete set null,

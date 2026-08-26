@@ -15,26 +15,49 @@ type StudyDocument = {
   mime_type: string;
   size_bytes: number | string;
   processing_status: string;
+  processing_error?: string | null;
+  ai_status: "idle" | "generating" | "completed" | "error";
+  ai_error?: string | null;
   page_count?: number | null;
   created_at: string;
 };
 
-type UploadState = { status: "idle" | "uploading" | "saving" | "done" | "error"; message?: string };
+type UploadState = { status: "idle" | "uploading" | "saving" | "processing" | "done" | "error"; message?: string };
 type AiTextResult = { title: string; content: string; citations: string[]; followUps: string[] };
 type AiCard = { front: string; back: string; citation: string };
 type AiQuestion = { question: string; options: string[]; answer: string; explanation: string; citation: string };
+type ProgressData = {
+  documents: { total: number; ready: number };
+  sessions: { total: number; focused_seconds: number | string; cycles: number };
+  generations: { total: number; tutor: number; summaries: number; flashcards: number; questions: number };
+};
+const EMPTY_PROGRESS: ProgressData = {
+  documents: { total: 0, ready: 0 },
+  sessions: { total: 0, focused_seconds: 0, cycles: 0 },
+  generations: { total: 0, tutor: 0, summaries: 0, flashcards: 0, questions: 0 },
+};
+
+function useReadyDocumentId(documents: StudyDocument[]) {
+  const [documentId, setDocumentId] = useState("");
+  useEffect(() => {
+    const ready = documents.filter(document => document.processing_status === "ready");
+    if (!ready.some(document => document.id === documentId)) setDocumentId(ready[0]?.id || "");
+  }, [documents, documentId]);
+  return [documentId, setDocumentId] as const;
+}
 
 function DocumentSelect({ documents, value, onChange }: { documents: StudyDocument[]; value: string; onChange: (value: string) => void }) {
+  const readyDocuments = documents.filter(document => document.processing_status === "ready");
   return <select value={value} onChange={event => onChange(event.target.value)}>
     <option value="">Choose study material…</option>
-    {documents.map(document => <option key={document.id} value={document.id}>{document.title}</option>)}
+    {readyDocuments.map(document => <option key={document.id} value={document.id}>{document.title}</option>)}
   </select>;
 }
 
-async function requestAi<T>(userId: string, mode: string, documentId: string, prompt: string) {
+async function requestAi<T>(mode: string, documentId: string, prompt: string) {
   const response = await fetch("/api/ai", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-studyos-user-id": userId },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({ mode, documentId, prompt }),
   });
   const data = await response.json();
@@ -54,79 +77,58 @@ const nav: { id: Section; label: string; icon: string }[] = [
   { id: "progress", label: "Progress", icon: "↗" },
 ];
 
-const masteryData = [41, 45, 47, 52, 56, 58, 61, 65, 68, 71, 73, 76];
-const studyBars = [34, 50, 22, 68, 46, 73, 58];
-
-function Metric({ label, value, suffix = "%", hint }: { label: string; value: number; suffix?: string; hint?: string }) {
+function Metric({ label, value, suffix = "", hint }: { label: string; value: number | string; suffix?: string; hint?: string }) {
   return (
     <div className="metric-card">
       <div className="metric-top"><span>{label}</span><span className="metric-arrow">↗</span></div>
       <div className="metric-value">{value}<small>{suffix}</small></div>
       {hint && <div className="metric-hint">{hint}</div>}
-      <div className="meter"><span style={{ width: `${Math.min(value, 100)}%` }} /></div>
-    </div>
-  );
-}
-
-function LineChart() {
-  const pts = masteryData.map((v, i) => `${(i / (masteryData.length - 1)) * 100},${100 - v}`).join(" ");
-  return (
-    <div className="chart-shell">
-      <div className="chart-head"><div><b>Mastery trend</b><span>Last 12 study sessions</span></div><strong>+35%</strong></div>
-      <svg viewBox="0 0 100 60" className="line-chart" preserveAspectRatio="none" aria-label="Mastery trend chart">
-        {[15, 30, 45].map(y => <line key={y} x1="0" x2="100" y1={y} y2={y} className="grid-line" />)}
-        <polyline points={pts} className="trend-line" fill="none" />
-      </svg>
-      <div className="chart-axis"><span>S1</span><span>S4</span><span>S8</span><span>S12</span></div>
+      <div className="meter"><span style={{ width: value === 0 ? "0%" : "100%" }} /></div>
     </div>
   );
 }
 
 function UploadCard({ onUpload, state }: { onUpload: (f: File) => void; state: UploadState }) {
   const ref = useRef<HTMLInputElement>(null);
-  const busy = state.status === "uploading" || state.status === "saving";
+  const busy = state.status === "uploading" || state.status === "saving" || state.status === "processing";
   return (
     <button className={`upload-card ${busy ? "busy" : ""}`} disabled={busy} onClick={() => ref.current?.click()}>
       <input ref={ref} type="file" accept=".pdf,.docx,.pptx,.txt" hidden onChange={(e) => e.target.files?.[0] && onUpload(e.target.files[0])} />
       <span className="upload-icon">{busy ? "↻" : "↑"}</span>
-      <b>{state.status === "uploading" ? "Uploading securely…" : state.status === "saving" ? "Adding to your library…" : "Upload study material"}</b>
-      <span>{state.message || "PDF, DOCX, PPTX or TXT · up to 60 MB"}</span>
+      <b>{state.status === "uploading" ? "Uploading securely…" : state.status === "saving" ? "Adding to your library…" : state.status === "processing" ? "Processing document…" : "Upload study material"}</b>
+      <span>{state.message || "PDF, DOCX, PPTX or TXT · up to 250 MB"}</span>
       <em>{busy ? "Please wait" : "Choose file"}</em>
     </button>
   );
 }
 
-function Dashboard({ go, documents }: { go: (s: Section) => void; documents: StudyDocument[] }) {
+function Dashboard({ go, documents, progress }: { go: (s: Section) => void; documents: StudyDocument[]; progress: ProgressData }) {
+  const focusedMinutes = Math.floor(Number(progress.sessions.focused_seconds || 0) / 60);
   return (
     <>
       <div className="hero-row">
-        <div><div className="eyebrow">TUESDAY · STUDY PLAN</div><h1>Good evening.</h1><p>Your exam readiness is moving in the right direction. Keep the momentum.</p></div>
+        <div><div className="eyebrow">YOUR STUDY WORKSPACE</div><h1>Welcome back.</h1><p>{documents.length ? "Continue with your own uploaded material." : "Upload your first document to begin."}</p></div>
         <button className="primary" onClick={() => go("session")}>Start study session <span>→</span></button>
       </div>
       <div className="metrics-grid">
-        <Metric label="Course progress" value={72} hint="+6% this week" />
-        <Metric label="Knowledge mastery" value={68} hint="+9% this week" />
-        <Metric label="Exam readiness" value={76} hint="On track" />
-        <Metric label="Flashcard retention" value={87} hint="42 due today" />
+        <Metric label="Documents" value={progress.documents.total} hint={`${progress.documents.ready} ready for AI`} />
+        <Metric label="Study sessions" value={progress.sessions.total} hint={`${progress.sessions.cycles} focus cycles`} />
+        <Metric label="Focused time" value={focusedMinutes} suffix=" min" hint="Recorded from real sessions" />
+        <Metric label="AI generations" value={progress.generations.total} hint="Tutor and study tools" />
       </div>
       <div className="dashboard-grid">
-        <LineChart />
-        <div className="focus-card">
-          <div className="section-kicker">AI PRIORITY</div><h3>What should I study now?</h3>
-          <div className="focus-topic"><div><span>Weakest high-value topic</span><b>CYP450 Metabolism</b></div><strong>52%</strong></div>
-          <div className="focus-plan"><span>10 min Tutor</span><span>10 min Flashcards</span><span>15 min Questions</span></div>
-          <button onClick={() => go("session")}>Start 35-min session</button>
-        </div>
+        <div className="panel empty-dashboard"><div className="section-kicker">REAL ACTIVITY</div><h3>{progress.sessions.total ? "Your saved study activity" : "No study activity yet"}</h3><p>{progress.sessions.total ? `${focusedMinutes} focused minutes across ${progress.sessions.total} sessions.` : "Start a study session and your activity will appear here."}</p><button onClick={() => go("session")}>Start study session</button></div>
+        <div className="focus-card"><div className="section-kicker">AI STUDY TOOLS</div><h3>{progress.documents.ready ? "Your material is ready" : "Add source material"}</h3><p>{progress.documents.ready ? "Ask Tutor, summarize, or generate active-recall material from your documents." : "AI tools remain empty until you upload a document."}</p><button onClick={() => go(progress.documents.ready ? "tutor" : "library")}>{progress.documents.ready ? "Ask AI Tutor" : "Open Library"}</button></div>
       </div>
       <div className="lower-grid">
         <div className="panel">
-          <div className="panel-head"><div><b>Study activity</b><span>This week · 8h 24m</span></div><button onClick={() => go("progress")}>View analytics</button></div>
-          <div className="bar-chart">{studyBars.map((v, i) => <div className="bar-col" key={i}><span style={{ height: `${v}%` }} /><small>{["M","T","W","T","F","S","S"][i]}</small></div>)}</div>
+          <div className="panel-head"><div><b>Generated study material</b><span>Only your real AI activity</span></div><button onClick={() => go("progress")}>View progress</button></div>
+          <div className="real-counts"><span><b>{progress.generations.tutor}</b>Tutor answers</span><span><b>{progress.generations.summaries}</b>Summaries</span><span><b>{progress.generations.flashcards}</b>Flashcard decks</span><span><b>{progress.generations.questions}</b>Question sets</span></div>
         </div>
         <div className="panel">
           <div className="panel-head"><div><b>Recent material</b><span>{documents.length ? `${documents.length} uploaded` : "Your active library"}</span></div><button onClick={() => go("library")}>Open library</button></div>
           {documents.length === 0 && <div className="empty-row">Upload your first document to start building your knowledge base.</div>}
-          {documents.slice(0,3).map((d) => <div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {statusLabel(d.processing_status)}</small></div><strong>0%</strong></div>)}
+          {documents.slice(0,3).map((d) => <div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {statusLabel(d.processing_status)}</small></div><span className={`status ${d.processing_status === "ready" ? "good" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div>)}
         </div>
       </div>
     </>
@@ -139,10 +141,28 @@ function formatBytes(value: number | string) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
+function uploadMimeType(file: File) {
+  if (file.type) return file.type;
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (extension === "pdf") return "application/pdf";
+  if (extension === "txt") return "text/plain";
+  if (extension === "docx") return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (extension === "pptx") return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  return "application/octet-stream";
+}
+
 function statusLabel(status: string) {
   if (status === "ready") return "Ready for AI";
   if (status === "processing") return "Processing";
+  if (status === "error") return "Processing error";
   return "Uploaded";
+}
+
+function aiStatusLabel(status: StudyDocument["ai_status"]) {
+  if (status === "generating") return "Generating";
+  if (status === "completed") return "Completed";
+  if (status === "error") return "AI error";
+  return "No AI actions yet";
 }
 
 function Library({ documents, upload, state, loading }: { documents: StudyDocument[]; upload: (f: File) => void; state: UploadState; loading: boolean }) {
@@ -152,10 +172,10 @@ function Library({ documents, upload, state, loading }: { documents: StudyDocume
       <div className="panel-head"><div><b>Your material</b><span>{documents.length} document{documents.length === 1 ? "" : "s"} in your private library</span></div></div>
       {loading && <div className="library-empty">Loading your library…</div>}
       {!loading && documents.length === 0 && <div className="library-empty"><b>No study material yet.</b><span>Upload a PDF and it will appear here permanently under your account.</span></div>}
-      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {d.page_count ? `${d.page_count} pages · ` : ""}{new Date(d.created_at).toLocaleDateString()}</small></div><span className={`status ${d.processing_status === "ready" ? "good" : ""}`}>{statusLabel(d.processing_status)}</span></div>)}
+      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small></div><div className="state-stack"><span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
     </div></div>
     {state.status === "error" && <div className="upload-error">{state.message}</div>}
-    <div className="panel pipeline"><b>AI processing pipeline</b><div className="pipeline-flow"><span className="done">Upload</span><i>→</i><span className="done">Private source</span><i>→</i><span className="done">Grounded context</span><i>→</i><span className="done">Citations</span><i>→</i><span className="done">Ready for AI</span></div><small className="pipeline-note">Phase 4 reads the selected private source directly for Tutor, Summary, Flashcards, and Questions.</small></div>
+    <div className="panel pipeline"><b>Document and AI states</b><div className="pipeline-flow"><span>Uploaded</span><i>→</i><span>Processing</span><i>→</i><span>Ready for AI</span><i>→</i><span>Generating</span><i>→</i><span>Completed / Error</span></div><small className="pipeline-note">Uploads go directly from your browser to private Vercel Blob storage. Access and ownership are verified on the server.</small></div>
   </>
 }
 
@@ -164,7 +184,7 @@ function PageTitle({ kicker, title, text }: { kicker:string; title:string; text:
 }
 
 
-function StudySession({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
+function StudySession({ documents, onProgressChange }: { documents: StudyDocument[]; onProgressChange: () => void }) {
   const [focusMinutes,setFocusMinutes]=useState(25);
   const [breakMinutes,setBreakMinutes]=useState(5);
   const [targetCycles,setTargetCycles]=useState(4);
@@ -189,7 +209,7 @@ function StudySession({ userId, documents }: { userId: string; documents: StudyD
 
   async function ensureSession(){
     if(sessionId) return sessionId;
-    const r=await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json','x-studyos-user-id':userId},body:JSON.stringify({title:'Pomodoro Study Session',mode:'pomodoro',documentId:documentId||null,focusMinutes,breakMinutes,targetCycles})});
+    const r=await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'Pomodoro Study Session',mode:'pomodoro',documentId:documentId||null,focusMinutes,breakMinutes,targetCycles})});
     const d=await r.json(); if(!r.ok) throw new Error(d.error||'Could not start session');
     setSessionId(d.session.id); return d.session.id as string;
   }
@@ -199,13 +219,15 @@ function StudySession({ userId, documents }: { userId: string; documents: StudyD
   async function completeInterval(){
     const id=await ensureSession();
     const planned=(phase==='focus'?focusMinutes:breakMinutes)*60;
-    await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json','x-studyos-user-id':userId},body:JSON.stringify({action:'interval',sessionId:id,intervalType:phase,plannedSeconds:planned,actualSeconds:planned,completed:true})});
+    await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'interval',sessionId:id,intervalType:phase,plannedSeconds:planned,actualSeconds:planned,completed:true})});
+    onProgressChange();
     setRunning(false);
     if(phase==='focus'){ const next=cycles+1; setCycles(next); if(next>=targetCycles){ await finish(id); return; } setPhase('break'); setSecondsLeft(breakMinutes*60); setStatus('Focus complete · take a break'); }
     else { setPhase('focus'); setSecondsLeft(focusMinutes*60); setStatus('Break complete · ready to focus'); }
   }
   async function finish(id=sessionId){
-    if(id) await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json','x-studyos-user-id':userId},body:JSON.stringify({action:'finish',sessionId:id})});
+    if(id) await fetch('/api/study-sessions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'finish',sessionId:id})});
+    onProgressChange();
     setRunning(false); setStatus('Session completed');
   }
   function reset(){ setRunning(false); setPhase('focus'); setCycles(0); setSessionId(''); setSecondsLeft(focusMinutes*60); setStatus('Ready'); }
@@ -220,18 +242,18 @@ function StudySession({ userId, documents }: { userId: string; documents: StudyD
   </>
 }
 
-function Tutor({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
+function Tutor({ documents, onStatusChange }: { documents: StudyDocument[]; onStatusChange: () => void }) {
   const [message,setMessage]=useState("");
-  const [documentId,setDocumentId]=useState(documents[0]?.id || "");
+  const [documentId,setDocumentId]=useReadyDocumentId(documents);
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState("");
   async function ask(prompt=message) {
     if (!documentId || !prompt.trim()) { setError("Choose a document and enter a question."); return; }
     setLoading(true); setError("");
-    try { setResult(await requestAi<AiTextResult>(userId,"tutor",documentId,prompt)); setMessage(""); }
+    try { setResult(await requestAi<AiTextResult>("tutor",documentId,prompt)); setMessage(""); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "AI Tutor failed"); }
-    finally { setLoading(false); }
+    finally { setLoading(false); onStatusChange(); }
   }
   return <>
     <PageTitle kicker="ACTIVE LEARNING" title="AI Tutor" text="Ask questions grounded only in your uploaded study material, with source references." />
@@ -240,17 +262,17 @@ function Tutor({ userId, documents }: { userId: string; documents: StudyDocument
       <div className="lesson-body ai-output">{!result && !loading && <div className="ai-empty"><b>Ask your first question</b><span>StudyOS will answer using only the selected file.</span></div>}{loading && <div className="ai-loading">Reading your material and preparing an answer…</div>}{result && <><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
       {result && <div className="quick-actions">{result.followUps.map(item=><button key={item} onClick={()=>void ask(item)}>{item}</button>)}</div>}
       {error && <div className="upload-error">{error}</div>}
-      <form className="chat-box" onSubmit={event=>{event.preventDefault();void ask();}}><input value={message} onChange={event=>setMessage(event.target.value)} placeholder="Ask about your notes…"/><button disabled={loading}>↑</button></form>
+      <form className="chat-box" onSubmit={event=>{event.preventDefault();void ask();}}><input value={message} disabled={loading || !documents.some(d=>d.processing_status==="ready")} onChange={event=>setMessage(event.target.value)} placeholder={documents.some(d=>d.processing_status==="ready") ? "Ask about your notes…" : "Upload and process a document first"}/><button aria-label="Ask AI" disabled={loading || !message.trim()}>↑</button></form>
     </div><div className="panel tutor-side"><b>How grounding works</b><div className="grounding-steps"><span>1</span><p><b>Select a source</b>Your private document is loaded securely.</p><span>2</span><p><b>Ask naturally</b>Use English, Italian, or Persian.</p><span>3</span><p><b>Verify citations</b>Answers identify their source location.</p></div><small>Daily safeguard · up to 40 AI generations per account.</small></div></div>
   </>
 }
 
-function Summary({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
-  const [documentId,setDocumentId]=useState(documents[0]?.id || "");
+function Summary({ documents, onStatusChange }: { documents: StudyDocument[]; onStatusChange: () => void }) {
+  const [documentId,setDocumentId]=useReadyDocumentId(documents);
   const [depth,setDepth]=useState("Detailed");
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>(userId,"summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);} }
+  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
   return <>
   <PageTitle kicker="SOURCE-GROUNDED" title="AI Summary" text="Generate revision notes at the depth you need without losing the structure of the original material." />
   <div className="summary-controls panel"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Coverage<select><option>Entire document</option></select></label><label>Depth<select value={depth} onChange={event=>setDepth(event.target.value)}><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate summary"}</button></div>
@@ -258,20 +280,20 @@ function Summary({ userId, documents }: { userId: string; documents: StudyDocume
   <div className="panel article ai-output">{!result&&!loading&&<div className="ai-empty"><b>No summary generated yet</b><span>Select a document and choose the depth.</span></div>}{loading&&<div className="ai-loading">Building your source-grounded summary…</div>}{result&&<><div className="article-top"><span>{depth.toUpperCase()} SUMMARY</span><span>{result.citations.length} source references</span></div><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
   </> }
 
-function Flashcards({ userId, documents }: { userId: string; documents: StudyDocument[] }) {
+function Flashcards({ documents, onStatusChange }: { documents: StudyDocument[]; onStatusChange: () => void }) {
   const [index,setIndex]=useState(0); const [flip,setFlip]=useState(false);
-  const [documentId,setDocumentId]=useState(documents[0]?.id||""); const [cards,setCards]=useState<AiCard[]>([]);
+  const [documentId,setDocumentId]=useReadyDocumentId(documents); const [cards,setCards]=useState<AiCard[]>([]);
   const [title,setTitle]=useState("Generated deck"); const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>(userId,"flashcards",documentId,"Focus on high-yield concepts and common misconceptions.");setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);}}
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>("flashcards",documentId,"Focus on high-yield concepts and common misconceptions.");setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);onStatusChange();}}
   const card=cards[index];
   return <><PageTitle kicker="ACTIVE RECALL" title="Flashcards" text="Generate source-grounded cards directly from your own notes." /><div className="flash-layout"><div className="panel deck-info"><b>{title}</b><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate 10 cards"}</button><small>{cards.length?`${cards.length} cards ready`:`Select a source to create a deck.`}</small></div>{error&&<div className="upload-error">{error}</div>}{card?<><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>SOURCE-GROUNDED</span><span>{index+1} / {cards.length}</span></div><h2>{flip?card.back:card.front}</h2><span className="tap-hint">{flip?card.citation:"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></>:<div className="panel ai-empty"><b>No cards yet</b><span>Generate a new deck from an uploaded document.</span></div>}</div></>
 }
 
-function Questions({ userId, documents, exams=false }: { userId: string; documents: StudyDocument[]; exams?: boolean }) {
+function Questions({ documents, exams=false, onStatusChange }: { documents: StudyDocument[]; exams?: boolean; onStatusChange: () => void }) {
   const [submitted,setSubmitted]=useState(false); const [answer,setAnswer]=useState(""); const [index,setIndex]=useState(0);
-  const [documentId,setDocumentId]=useState(documents[0]?.id||""); const [questions,setQuestions]=useState<AiQuestion[]>([]);
+  const [documentId,setDocumentId]=useReadyDocumentId(documents); const [questions,setQuestions]=useState<AiQuestion[]>([]);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>(userId,"questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.");setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);}}
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>("questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.");setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);onStatusChange();}}
   const question=questions[index];
   return <><PageTitle kicker={exams?"SIMULATION":"ACTIVE RECALL"} title={exams?"Exam Simulator":"Questions"} text={exams?"Simulate the real exam and measure readiness by topic.":"Upload existing question banks or generate questions directly from selected study material."} />
   <div className="panel exam-builder"><div className="builder-row"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Type<select><option>Multiple Choice</option></select></label><label>Difficulty<select><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":exams?"Build exam":"Generate questions"}</button></div></div>
@@ -279,13 +301,11 @@ function Questions({ userId, documents, exams=false }: { userId: string; documen
   {question?<div className="panel question-card"><div className="question-top"><span>QUESTION {index+1} OF {questions.length}</span><span>SOURCE-GROUNDED</span></div><h2>{question.question}</h2>{question.options.map((option,i)=><label className={`option ${answer===option?"selected":""}`} key={option}><input type="radio" name="q" value={option} checked={answer===option} onChange={()=>setAnswer(option)}/><span>{String.fromCharCode(65+i)}</span>{option}</label>)}<div className="question-footer"><button className="ghost" disabled={index===0} onClick={()=>{setIndex(index-1);setSubmitted(false);setAnswer("");}}>Previous</button><button className="primary" disabled={!answer} onClick={()=>setSubmitted(true)}>Check answer</button></div>{submitted&&<div className={`result ${answer===question.answer?"correct":"wrong"}`}><b>{answer===question.answer?"Correct":"Review this concept"}</b><span>{question.explanation}</span><small>{question.citation}</small><button className="ghost" disabled={index>=questions.length-1} onClick={()=>{setIndex(index+1);setSubmitted(false);setAnswer("");}}>Next question</button></div>}</div>:<div className="panel ai-empty"><b>No questions generated yet</b><span>Choose a document to build a source-grounded practice set.</span></div>}</>
 }
 
-function Progress() {
-  const topics=[["Pharmacokinetics",89],["Pharmacodynamics",81],["CYP450",63],["Drug interactions",58],["Receptor theory",52]] as const;
-  return <><PageTitle kicker="MEASURABLE LEARNING" title="Progress & Analytics" text="See exactly what you know, what you are forgetting, and whether you are getting closer to the exam." />
-  <div className="metrics-grid"><Metric label="Course progress" value={72}/><Metric label="Knowledge mastery" value={68}/><Metric label="Exam readiness" value={76}/><Metric label="Question accuracy" value={81}/></div>
-  <div className="dashboard-grid"><LineChart/><div className="panel readiness"><div className="section-kicker">EXAM READINESS</div><div className="readiness-score"><strong>76%</strong><span>Good progress · On track</span></div>{[["Course coverage",91],["Knowledge mastery",73],["Question accuracy",82],["Flashcard retention",86]].map(([n,v])=><div className="factor" key={n as string}><span>{n}</span><div className="meter"><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div></div>
-  <div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>Mastery by topic</b><span>Click a weak topic to review it</span></div></div><div className="topic-bars">{topics.map(([t,v])=><div key={t}><span>{t}</span><div className="meter"><i style={{width:`${v}%`}}/></div><b>{v}%</b></div>)}</div></div><div className="panel"><div className="panel-head"><div><b>Weekly consistency</b><span>Current streak · 8 days</span></div></div><div className="heatmap">{Array.from({length:35},(_,i)=><span key={i} style={{opacity:.15+((i*7)%10)/12}}/> )}</div><div className="stat-row"><span><b>8h 24m</b>Study time</span><span><b>327</b>Questions</span><span><b>412</b>Cards</span></div></div></div>
-  <div className="panel weekly"><div><span className="section-kicker">THIS WEEK</span><h3>Visible improvement</h3></div><div className="weekly-change"><span>Overall mastery</span><b>61% <i>→</i> 68%</b><strong>+7%</strong></div><div className="weekly-change"><span>Biggest improvement</span><b>Pharmacokinetics</b><strong>+21%</strong></div><div className="weekly-change"><span>Priority weakness</span><b>Receptor theory</b><strong className="warn">52%</strong></div></div></>
+function Progress({ progress }: { progress: ProgressData }) {
+  const focusedMinutes = Math.floor(Number(progress.sessions.focused_seconds || 0) / 60);
+  return <><PageTitle kicker="MEASURABLE LEARNING" title="Progress & Analytics" text="Every number below comes from your saved StudyOS activity." />
+  <div className="metrics-grid"><Metric label="Documents" value={progress.documents.total}/><Metric label="Focused minutes" value={focusedMinutes}/><Metric label="Completed cycles" value={progress.sessions.cycles}/><Metric label="AI generations" value={progress.generations.total}/></div>
+  <div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>AI activity</b><span>Generated from your own documents</span></div></div><div className="real-counts"><span><b>{progress.generations.tutor}</b>Tutor answers</span><span><b>{progress.generations.summaries}</b>Summaries</span><span><b>{progress.generations.flashcards}</b>Flashcard decks</span><span><b>{progress.generations.questions}</b>Question sets</span></div></div><div className="panel empty-dashboard"><div className="section-kicker">NO DEMO DATA</div><h3>{progress.generations.total || progress.sessions.total ? "Your real activity is recorded" : "Your progress starts at zero"}</h3><p>StudyOS adds progress only after you study or generate content.</p></div></div></>
 }
 
 export default function StudyApp() {
@@ -295,6 +315,7 @@ export default function StudyApp() {
   const userId = session.data?.user?.id || "";
   const [section,setSection]=useState<Section>("dashboard");
   const [documents,setDocuments]=useState<StudyDocument[]>([]);
+  const [progress,setProgress]=useState<ProgressData>(EMPTY_PROGRESS);
   const [libraryLoading,setLibraryLoading]=useState(true);
   const [uploadState,setUploadState]=useState<UploadState>({status:"idle"});
   const [collapsed,setCollapsed]=useState(false);
@@ -314,7 +335,7 @@ export default function StudyApp() {
     if (!userId) return;
     setLibraryLoading(true);
     try {
-      const response = await fetch("/api/documents", { headers: { "x-studyos-user-id": userId } });
+      const response = await fetch("/api/documents");
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not load library");
       setDocuments(data.documents || []);
@@ -325,10 +346,29 @@ export default function StudyApp() {
     }
   }
 
-  useEffect(() => { void loadDocuments(); }, [userId]);
+  async function loadProgress() {
+    if (!userId) return;
+    try {
+      const response = await fetch("/api/progress");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not load progress");
+      setProgress(data);
+    } catch (error) { console.error(error); }
+  }
+
+  useEffect(() => { void Promise.all([loadDocuments(), loadProgress()]); }, [userId]);
 
   async function handleUpload(file: File) {
     if (!userId) return;
+    if (file.size > 250 * 1024 * 1024) {
+      setUploadState({ status: "error", message: "Choose a file no larger than 250 MB." });
+      return;
+    }
+    const mimeType = uploadMimeType(file);
+    if (mimeType === "application/octet-stream") {
+      setUploadState({ status: "error", message: "Choose a PDF, DOCX, PPTX, or TXT file." });
+      return;
+    }
     setSection("library");
     setUploadState({ status: "uploading", message: `${file.name} · ${formatBytes(file.size)}` });
     try {
@@ -341,24 +381,35 @@ export default function StudyApp() {
       const title = file.name.replace(/\.[^/.]+$/, "");
       const response = await fetch("/api/documents", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-studyos-user-id": userId },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          title, originalName: file.name, fileUrl: blob.url, pathname: blob.pathname, mimeType: file.type || "application/octet-stream", sizeBytes: file.size, sourceLanguage: "it", explanationLanguage: "it"
+          title, originalName: file.name, fileUrl: blob.url, pathname: blob.pathname, mimeType, sizeBytes: file.size, sourceLanguage: "it", explanationLanguage: "it"
         }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not save document");
       setDocuments((current) => [data.document, ...current]);
-      setUploadState({ status: "done", message: "Uploaded successfully. Ready for AI study tools." });
+      setUploadState({ status: "processing", message: "Upload complete. Verifying the private source…" });
+      const processingResponse = await fetch("/api/documents", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "process", documentId: data.document.id }),
+      });
+      const processingData = await processingResponse.json();
+      if (!processingResponse.ok) throw new Error(processingData.error || "Document processing failed");
+      setDocuments(current => current.map(document => document.id === processingData.document.id ? processingData.document : document));
+      setUploadState({ status: "done", message: "Ready for AI." });
+      void loadProgress();
       setTimeout(() => setUploadState({status:"idle"}), 4000);
     } catch (error) {
       setUploadState({ status: "error", message: error instanceof Error ? error.message : "Upload failed" });
+      void loadDocuments();
     }
   }
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
-    <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Exam in 12 days</span><b>76% ready</b></div><button className="icon-btn">⌕</button><button className="icon-btn">◐</button></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents}/>} {section==="session"&&<StudySession userId={userId} documents={documents}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor userId={userId} documents={documents}/>} {section==="summary"&&<Summary userId={userId} documents={documents}/>} {section==="flashcards"&&<Flashcards userId={userId} documents={documents}/>} {section==="questions"&&<Questions userId={userId} documents={documents}/>} {section==="exams"&&<Questions userId={userId} documents={documents} exams/>} {section==="progress"&&<Progress/>}
+    <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Your private workspace</span><b>{progress.documents.ready} AI-ready</b></div></div></header><div className="content">
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
     </div></main>
   </div>
 }
