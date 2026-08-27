@@ -34,8 +34,10 @@ type StudyDocument = {
 
 type UploadState = { status: "idle" | "uploading" | "saving" | "processing" | "done" | "error"; message?: string };
 type AiTextResult = { title: string; content: string; citations: string[]; followUps: string[] };
+type TutorResult = { title:string; explanation:string; definitions:Array<{term:string;definition:string}>; steps:string[]; keyPoints:string[]; examples:string[]; examCallouts:string[]; tables:Array<{title:string;headers:string[];rows:string[][]}>; citations:string[]; followUps:string[] };
 type AiCard = { front: string; back: string; citation: string };
 type AiQuestion = { question: string; options: string[]; answer: string; explanation: string; citation: string };
+type AiArtifact={id:string;mode:string;document_title:string;response_json:any;provider:string;model:string;status:string;created_at:string};
 type ProgressData = {
   documents: { total: number; ready: number };
   sessions: { total: number; focused_seconds: number | string; cycles: number };
@@ -67,15 +69,19 @@ function DocumentSelect({ documents, value, onChange }: { documents: StudyDocume
 }
 
 async function requestAi<T>(mode: string, documentId: string, prompt: string,scope:DocumentScope) {
+  return (await requestAiResponse<T>(mode,documentId,prompt,scope)).result;
+}
+async function requestAiResponse<T>(mode:string,documentId:string,prompt:string,scope:DocumentScope,conversationId=""){
   const response = await fetch("/api/ai", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mode, documentId, prompt,scope }),
+    body: JSON.stringify({ mode, documentId, prompt,scope,conversationId }),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "AI generation failed");
-  return data.result as T;
+  return data as {result:T;conversationId?:string;generationId?:string};
 }
+function GeneratedHistory(){const[items,setItems]=useState<AiArtifact[]>([]),[selected,setSelected]=useState<AiArtifact|null>(null);useEffect(()=>{fetch("/api/ai").then(r=>r.json()).then(data=>setItems(data.artifacts||[])).catch(()=>{})},[]);return <div className="panel generated-history"><div className="panel-head"><div><b>Saved AI material</b><span>Reopen summaries, flashcards, questions, and exams</span></div></div>{!items.length&&<div className="empty-row">No saved generations yet.</div>}<div className="artifact-history">{items.map(item=><button key={item.id} onClick={()=>setSelected(item)}><b>{item.response_json?.title||item.mode}</b><span>{item.document_title} · {item.provider}/{item.model}</span></button>)}</div>{selected&&<div className="artifact-reopen"><h3>{selected.response_json?.title||selected.mode}</h3>{selected.response_json?.content&&<p>{selected.response_json.content}</p>}{Array.isArray(selected.response_json?.items)&&<p>{selected.response_json.items.length} saved item{selected.response_json.items.length===1?"":"s"}. Open the matching study tool to practise this set.</p>}<small>{new Date(selected.created_at).toLocaleString()} · {selected.status}</small></div>}</div>}
 
 const nav: { id: Section; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌂" },
@@ -275,17 +281,24 @@ function StudySession({ documents, onProgressChange }: { documents: StudyDocumen
   </>
 }
 
-function Tutor({ documents, onStatusChange }: { documents: StudyDocument[]; onStatusChange: () => void }) {
+function Tutor({ documents, onStatusChange, openPdf }: { documents: StudyDocument[]; onStatusChange: () => void;openPdf:(document:StudyDocument)=>void }) {
   const [message,setMessage]=useState("");
   const [documentId,setDocumentId]=useReadyDocumentId(documents);
-  const [result,setResult]=useState<AiTextResult | null>(null);
+  const [result,setResult]=useState<TutorResult | null>(null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState("");
-  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  const [scope,setScope]=useState<DocumentScope>({type:"entire"});
+  const[conversationId,setConversationId]=useState("");
+  const[history,setHistory]=useState<Array<{id:string;title:string;document_title:string;updated_at:string}>>([]);
+  const[thread,setThread]=useState<Array<{id:string;role:string;content_json:any}>>([]);
+  useEffect(()=>{fetch("/api/ai").then(r=>r.json()).then(data=>setHistory(data.conversations||[])).catch(()=>{})},[]);
+  function openCitation(source:string){const document=documents.find(item=>item.id===documentId);const page=Number(source.match(/pp?\.\s*(\d+)/i)?.[1]||0);if(document?.mime_type==="application/pdf"&&page)openPdf({...document,current_page:page})}
+  async function reopen(id:string){setLoading(true);setError("");try{const response=await fetch(`/api/ai?conversationId=${encodeURIComponent(id)}`),data=await response.json();if(!response.ok)throw new Error(data.error||"Could not reopen conversation");setConversationId(id);setDocumentId(data.conversation.document_id);setScope(data.conversation.scope_json);setThread(data.messages||[]);const last=[...(data.messages||[])].reverse().find((item:any)=>item.role==="assistant");setResult(last?.content_json||null)}catch(reason){setError(reason instanceof Error?reason.message:"Could not reopen conversation")}finally{setLoading(false)}}
+  function newConversation(){setConversationId("");setThread([]);setResult(null);setMessage("");}
   async function ask(prompt=message) {
     if (!documentId || !prompt.trim()) { setError("Choose a document and enter a question."); return; }
     setLoading(true); setError("");
-    try { setResult(await requestAi<AiTextResult>("tutor",documentId,prompt,scope)); setMessage(""); }
+    try { const response=await requestAiResponse<TutorResult>("tutor",documentId,prompt,scope,conversationId);setResult(response.result);setConversationId(response.conversationId||conversationId);setThread(current=>[...current,{id:`user-${Date.now()}`,role:"user",content_json:{text:prompt}},{id:`assistant-${Date.now()}`,role:"assistant",content_json:response.result}]);setHistory([]);fetch("/api/ai").then(r=>r.json()).then(data=>setHistory(data.conversations||[])).catch(()=>{});setMessage(""); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "AI Tutor failed"); }
     finally { setLoading(false); onStatusChange(); }
   }
@@ -294,11 +307,11 @@ function Tutor({ documents, onStatusChange }: { documents: StudyDocument[]; onSt
     <div className="tutor-grid"><div className="panel lesson-panel">
       <div className="ai-source-row"><label>Source<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><span className="ai-badge">SOURCE-GROUNDED</span></div>
       <DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/>
-      <div className="lesson-body ai-output">{!result && !loading && <div className="ai-empty"><b>Ask your first question</b><span>StudyOS will answer using only the selected file.</span></div>}{loading && <div className="ai-loading">Reading your material and preparing an answer…</div>}{result && <><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
+      <div className="lesson-body ai-output">{!result && !loading && <div className="ai-empty"><b>Ask your first question</b><span>StudyOS will answer using only the selected file.</span></div>}{loading && <div className="ai-loading">Reading your scoped material and preparing an answer…</div>}{result && <div className="tutor-answer"><h2>{result.title}</h2><p className="lead">{result.explanation}</p>{result.definitions?.length>0&&<section><h3>Definitions</h3><dl>{result.definitions.map(item=><div key={item.term}><dt>{item.term}</dt><dd>{item.definition}</dd></div>)}</dl></section>}{result.steps?.length>0&&<section><h3>Steps</h3><ol>{result.steps.map(item=><li key={item}>{item}</li>)}</ol></section>}{result.keyPoints?.length>0&&<section><h3>Key points</h3><ul>{result.keyPoints.map(item=><li key={item}>{item}</li>)}</ul></section>}{result.examples?.length>0&&<section><h3>Examples</h3>{result.examples.map(item=><p key={item}>{item}</p>)}</section>}{result.examCallouts?.length>0&&<aside className="exam-callout"><b>Exam focus</b>{result.examCallouts.map(item=><p key={item}>{item}</p>)}</aside>}{result.tables?.map(table=><section key={table.title}><h3>{table.title}</h3><div className="ai-table-wrap"><table><thead><tr>{table.headers.map(header=><th key={header}>{header}</th>)}</tr></thead><tbody>{table.rows.map((row,index)=><tr key={index}>{row.map((cell,cellIndex)=><td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div></section>)}<div className="citation-list">{result.citations.map(source=><button className="source-chip" key={source} onClick={()=>openCitation(source)}>{source}</button>)}</div></div>}</div>
       {result && <div className="quick-actions">{result.followUps.map(item=><button key={item} onClick={()=>void ask(item)}>{item}</button>)}</div>}
       {error && <div className="upload-error">{error}</div>}
       <form className="chat-box" onSubmit={event=>{event.preventDefault();void ask();}}><input value={message} disabled={loading || !documents.some(d=>d.processing_status==="ready")} onChange={event=>setMessage(event.target.value)} placeholder={documents.some(d=>d.processing_status==="ready") ? "Ask about your notes…" : "Upload and process a document first"}/><button aria-label="Ask AI" disabled={loading || !message.trim()}>↑</button></form>
-    </div><div className="panel tutor-side"><b>How grounding works</b><div className="grounding-steps"><span>1</span><p><b>Select a source</b>Your private document is loaded securely.</p><span>2</span><p><b>Ask naturally</b>Use English, Italian, or Persian.</p><span>3</span><p><b>Verify citations</b>Answers identify their source location.</p></div><small>Daily safeguard · up to 40 AI generations per account.</small></div></div>
+    </div><div className="panel tutor-side"><div className="panel-head"><div><b>Conversation history</b><span>Saved privately to your account</span></div><button onClick={newConversation}>New</button></div><div className="tutor-history">{history.map(item=><button className={item.id===conversationId?"active":""} key={item.id} onClick={()=>void reopen(item.id)}><b>{item.title}</b><span>{item.document_title}</span></button>)}{!history.length&&<small>No saved conversations yet.</small>}</div><small>{thread.length?`${thread.length} persisted messages · `:""}Daily safeguard · up to 40 AI generations per account.</small></div></div>
   </>
 }
 
@@ -307,7 +320,7 @@ function Summary({ documents, onStatusChange }: { documents: StudyDocument[]; on
   const [depth,setDepth]=useState("Detailed");
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  const [scope,setScope]=useState<DocumentScope>({type:"entire"});
   async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`,scope));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
   return <>
   <PageTitle kicker="SOURCE-GROUNDED" title="AI Summary" text="Generate revision notes at the depth you need without losing the structure of the original material." />
@@ -320,7 +333,7 @@ function Flashcards({ documents, onStatusChange }: { documents: StudyDocument[];
   const [index,setIndex]=useState(0); const [flip,setFlip]=useState(false);
   const [documentId,setDocumentId]=useReadyDocumentId(documents); const [cards,setCards]=useState<AiCard[]>([]);
   const [title,setTitle]=useState("Generated deck"); const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  const [scope,setScope]=useState<DocumentScope>({type:"entire"});
   async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>("flashcards",documentId,"Focus on high-yield concepts and common misconceptions.",scope);setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);onStatusChange();}}
   const card=cards[index];
   return <><PageTitle kicker="ACTIVE RECALL" title="Flashcards" text="Generate source-grounded cards directly from your own notes." /><div className="flash-layout"><div className="panel deck-info"><b>{title}</b><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate 10 cards"}</button><small>{cards.length?`${cards.length} cards ready`:`Select a source to create a deck.`}</small></div>{error&&<div className="upload-error">{error}</div>}{card?<><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>SOURCE-GROUNDED</span><span>{index+1} / {cards.length}</span></div><h2>{flip?card.back:card.front}</h2><span className="tap-hint">{flip?card.citation:"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></>:<div className="panel ai-empty"><b>No cards yet</b><span>Generate a new deck from an uploaded document.</span></div>}</div></>
@@ -330,7 +343,7 @@ function Questions({ documents, exams=false, onStatusChange }: { documents: Stud
   const [submitted,setSubmitted]=useState(false); const [answer,setAnswer]=useState(""); const [index,setIndex]=useState(0);
   const [documentId,setDocumentId]=useReadyDocumentId(documents); const [questions,setQuestions]=useState<AiQuestion[]>([]);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  const [scope,setScope]=useState<DocumentScope>({type:"entire"});
   async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>("questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.",scope);setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);onStatusChange();}}
   const question=questions[index];
   return <><PageTitle kicker={exams?"SIMULATION":"ACTIVE RECALL"} title={exams?"Exam Simulator":"Questions"} text={exams?"Simulate the real exam and measure readiness by topic.":"Upload existing question banks or generate questions directly from selected study material."} />
@@ -344,7 +357,7 @@ function Progress({ progress }: { progress: ProgressData }) {
   const readingMinutes = Math.floor(Number(progress.reading?.reading_seconds || 0) / 60);
   return <><PageTitle kicker="MEASURABLE LEARNING" title="Progress & Analytics" text="Every number below comes from your saved StudyOS activity." />
   <div className="metrics-grid"><Metric label="Documents" value={progress.documents.total}/><Metric label="Focused minutes" value={focusedMinutes}/><Metric label="PDF reading" value={readingMinutes} suffix=" min"/><Metric label="Average read" value={Math.round(Number(progress.reading?.average_percent || 0))} suffix="%"/></div>
-  <div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>AI activity</b><span>Generated from your own documents</span></div></div><div className="real-counts"><span><b>{progress.generations.tutor}</b>Tutor answers</span><span><b>{progress.generations.summaries}</b>Summaries</span><span><b>{progress.generations.flashcards}</b>Flashcard decks</span><span><b>{progress.generations.questions}</b>Question sets</span></div></div><div className="panel empty-dashboard"><div className="section-kicker">YOUR ACTIVITY</div><h3>{progress.generations.total || progress.sessions.total ? "Your real activity is recorded" : "Your progress starts at zero"}</h3><p>StudyOS adds progress only after you study or generate content.</p></div></div></>
+  <div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>AI activity</b><span>Generated from your own documents</span></div></div><div className="real-counts"><span><b>{progress.generations.tutor}</b>Tutor answers</span><span><b>{progress.generations.summaries}</b>Summaries</span><span><b>{progress.generations.flashcards}</b>Flashcard decks</span><span><b>{progress.generations.questions}</b>Question sets</span></div></div><div className="panel empty-dashboard"><div className="section-kicker">YOUR ACTIVITY</div><h3>{progress.generations.total || progress.sessions.total ? "Your real activity is recorded" : "Your progress starts at zero"}</h3><p>StudyOS adds progress only after you study or generate content.</p></div></div><GeneratedHistory/></>
 }
 
 export default function StudyApp() {
@@ -479,7 +492,7 @@ export default function StudyApp() {
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Your private workspace</span><b>{progress.documents.ready} AI-ready</b></div></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} retry={retryProcessing} retryingId={retryingId} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} retry={retryProcessing} retryingId={retryingId} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} openPdf={setReaderDocument} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
     </div></main>
     {readerDocument && <PdfReader document={readerDocument} onClose={() => { setReaderDocument(null); void Promise.all([loadDocuments(), loadProgress()]); }} onProgress={() => void Promise.all([loadDocuments(), loadProgress()])}/>}
   </div>

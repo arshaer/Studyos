@@ -102,6 +102,8 @@ export function ensureStudySchema() {
       await sql`alter table public.document_chunks add column if not exists char_start int`;
       await sql`alter table public.document_chunks add column if not exists char_end int`;
       await sql`alter table public.document_chunks add column if not exists token_estimate int`;
+      await sql`alter table public.document_sections add column if not exists detection_method text not null default 'heuristic'`;
+      await sql`alter table public.document_sections add column if not exists confidence_reason text`;
       await sql`create index if not exists document_chunks_owner_idx on public.document_chunks (user_id, document_id, chunk_index)`;
       await sql`
         create table if not exists public.document_reading_progress (
@@ -160,6 +162,30 @@ export function ensureStudySchema() {
       `;
       await sql`alter table public.ai_generations add column if not exists provider text not null default 'openai'`;
       await sql`alter table public.ai_generations add column if not exists scope_json jsonb`;
+      await sql`alter table public.ai_generations add column if not exists status text not null default 'completed'`;
+      await sql`alter table public.ai_generations add column if not exists updated_at timestamptz not null default now()`;
+      await sql`alter table public.ai_generations add column if not exists completed_at timestamptz`;
+      await sql`
+        create table if not exists public.ai_conversations (
+          id uuid primary key default gen_random_uuid(), user_id text not null,
+          document_id uuid not null references public.documents(id) on delete cascade,
+          title text not null, scope_json jsonb not null default '{"type":"entire"}'::jsonb,
+          provider text, model text, created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now()
+        )
+      `;
+      await sql`create index if not exists ai_conversations_owner_idx on public.ai_conversations(user_id, updated_at desc)`;
+      await sql`
+        create table if not exists public.ai_messages (
+          id uuid primary key default gen_random_uuid(), conversation_id uuid not null references public.ai_conversations(id) on delete cascade,
+          user_id text not null, role text not null check(role in ('user','assistant')),
+          content_json jsonb not null, citations_json jsonb not null default '[]'::jsonb,
+          provider text, model text, input_tokens int not null default 0, output_tokens int not null default 0,
+          status text not null default 'completed', created_at timestamptz not null default now()
+        )
+      `;
+      await sql`create index if not exists ai_messages_owner_idx on public.ai_messages(user_id, conversation_id, created_at)`;
+      await sql`alter table public.ai_generations add column if not exists conversation_id uuid references public.ai_conversations(id) on delete set null`;
       await sql`create index if not exists ai_generations_user_created_idx on public.ai_generations (user_id, created_at desc)`;
     })().catch((error) => {
       schemaReady = null;

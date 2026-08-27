@@ -23,6 +23,7 @@ create table if not exists public.document_sections (
   kind text not null, level int not null default 1, title text not null, order_index int not null,
   page_start int not null, page_end int not null, char_start int not null, char_end int not null,
   confidence numeric(4,3), source text not null default 'heuristic', created_at timestamptz not null default now(),
+  detection_method text not null default 'heuristic', confidence_reason text,
   updated_at timestamptz not null default now(), unique (document_id, order_index)
 );
 create index if not exists document_sections_owner_idx on public.document_sections (user_id, document_id, order_index);
@@ -43,8 +44,23 @@ create table if not exists public.ai_generations (
   document_id uuid references public.documents(id) on delete set null,
   mode text not null, provider text not null default 'gemini', model text not null, prompt text, response_json jsonb not null,
   input_tokens int not null default 0, output_tokens int not null default 0, scope_json jsonb,
+  status text not null default 'completed', completed_at timestamptz, updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
+create table if not exists public.ai_conversations (
+  id uuid primary key default gen_random_uuid(), user_id text not null,
+  document_id uuid not null references public.documents(id) on delete cascade,
+  title text not null, scope_json jsonb not null default '{"type":"entire"}'::jsonb,
+  provider text, model text, created_at timestamptz not null default now(), updated_at timestamptz not null default now()
+);
+create table if not exists public.ai_messages (
+  id uuid primary key default gen_random_uuid(), conversation_id uuid not null references public.ai_conversations(id) on delete cascade,
+  user_id text not null, role text not null check(role in ('user','assistant')), content_json jsonb not null,
+  citations_json jsonb not null default '[]'::jsonb, provider text, model text,
+  input_tokens int not null default 0, output_tokens int not null default 0,
+  status text not null default 'completed', created_at timestamptz not null default now()
+);
+alter table public.ai_generations add column if not exists conversation_id uuid references public.ai_conversations(id) on delete set null;
 create table if not exists public.document_chunks (
   id bigserial primary key,
   document_id uuid not null references public.documents(id) on delete cascade,

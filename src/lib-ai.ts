@@ -35,7 +35,7 @@ function taskFor(mode: AiMode, prompt: string) {
   if (mode === "summary") return `Create a structured, exam-focused summary. ${prompt || "Cover the entire document."}`;
   if (mode === "flashcards") return `Create 10 high-quality active-recall flashcards. ${prompt}`;
   if (mode === "questions") return `Create 8 multiple-choice questions with exactly four options each. ${prompt}`;
-  return `Answer this learner's question and teach the concept step by step: ${prompt}`;
+  return `Answer this learner's question in the language of the newest question. Produce a polished teaching response with a concise title, clear explanation, useful definitions, ordered steps when relevant, key points, examples, exam callouts, comparison tables when useful, exact citations, and short follow-up actions. Never emit raw markdown markers inside fields: ${prompt}`;
 }
 
 function strictJsonInstruction(schema: Record<string, unknown>, citations: string[]) {
@@ -60,9 +60,10 @@ function plainTextInstruction(citations: string[]) {
   ].join("\n");
 }
 
-function textResult(mode: "tutor" | "summary", text: string, citations: string[]) {
+function textResult(mode: "tutor" | "summary", text: string, citations: string[],schema?:Record<string,unknown>) {
   const content = text.trim().replace(/^```(?:text|markdown)?\s*/i, "").replace(/\s*```$/, "");
   if (!content) throw new StructuredOutputError("Gemini returned an empty plain-text fallback");
+  if(mode==="tutor"&&"explanation" in ((schema?.properties||{}) as Record<string,unknown>))return{title:"Answer",explanation:content,definitions:[],steps:[],keyPoints:[],examples:[],examCallouts:[],tables:[],citations:citations.filter(citation=>content.includes(citation)),followUps:[]};
   return {
     title: mode === "summary" ? "Summary" : "Answer",
     content,
@@ -212,7 +213,7 @@ class GeminiProvider implements AiProvider {
       totalUsage = { input_tokens: first.usage.input_tokens + retry.usage.input_tokens, output_tokens: first.usage.output_tokens + retry.usage.output_tokens };
       try {
         parsed = textMode
-          ? textResult(request.mode as "tutor" | "summary", retry.text, request.allowedCitations || [])
+          ? textResult(request.mode as "tutor" | "summary", retry.text, request.allowedCitations || [],effectiveSchema)
           : parseStructuredOutput(retry.text, effectiveSchema);
         const issues = validateSchema(parsed, effectiveSchema);
         if (issues.length) throw new StructuredOutputError(`Gemini fallback failed validation: ${issues.slice(0, 4).join("; ")}`);

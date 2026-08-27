@@ -16,6 +16,7 @@ type Scope={type:"entire"|"sections"|"pages";sectionIds?:string[];pageStart?:num
 function schemaFor(mode: AiMode) {
   if (mode === "flashcards") return { type: "object", properties: { title: { type: "string", description: "Short deck title in the learner's language" }, items: { type: "array", minItems: 10, maxItems: 10, items: { type: "object", properties: { front: { type: "string" }, back: { type: "string" }, citation: { type: "string", description: "One exact SOURCE label supplied in the context" } }, required: ["front", "back", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
   if (mode === "questions") return { type: "object", properties: { title: { type: "string" }, items: { type: "array", minItems: 8, maxItems: 8, items: { type: "object", properties: { question: { type: "string" }, options: { type: "array", minItems: 4, maxItems: 4, items: { type: "string" } }, answer: { type: "string", description: "Must exactly equal one of the four options" }, explanation: { type: "string" }, citation: { type: "string", description: "One exact SOURCE label supplied in the context" } }, required: ["question", "options", "answer", "explanation", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
+  if(mode === "tutor") return { type:"object", properties:{ title:{type:"string"}, explanation:{type:"string"}, definitions:{type:"array",items:{type:"object",properties:{term:{type:"string"},definition:{type:"string"}},required:["term","definition"],additionalProperties:false}}, steps:{type:"array",items:{type:"string"}}, keyPoints:{type:"array",items:{type:"string"}}, examples:{type:"array",items:{type:"string"}}, examCallouts:{type:"array",items:{type:"string"}}, tables:{type:"array",items:{type:"object",properties:{title:{type:"string"},headers:{type:"array",items:{type:"string"}},rows:{type:"array",items:{type:"array",items:{type:"string"}}}},required:["title","headers","rows"],additionalProperties:false}}, citations:{type:"array",items:{type:"string"}}, followUps:{type:"array",items:{type:"string"}} }, required:["title","explanation","definitions","steps","keyPoints","examples","examCallouts","tables","citations","followUps"], additionalProperties:false };
   return { type: "object", properties: { title: { type: "string" }, content: { type: "string", description: "Grounded answer or summary in the learner's language" }, citations: { type: "array", description: "Exact SOURCE labels supporting the answer; empty only when the source does not answer the request", items: { type: "string" } }, followUps: { type: "array", items: { type: "string" } } }, required: ["title", "content", "citations", "followUps"], additionalProperties: false };
 }
 
@@ -68,6 +69,7 @@ async function hierarchicalSummary(name: string, chunks: StoredChunk[], prompt: 
 export async function POST(request: Request) {
   let userId = "";
   let documentId = "";
+  let generationId = "";
   try {
     userId = await currentUserId();
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -75,6 +77,7 @@ export async function POST(request: Request) {
     const mode = String(body?.mode || "tutor") as AiMode;
     documentId = String(body?.documentId || "").trim();
     const prompt = String(body?.prompt || "").trim().slice(0, 4000);
+    let conversationId=String(body?.conversationId||"");
     const scope=(body?.scope||{}) as Scope;
     if(!["entire","sections","pages"].includes(scope.type))return NextResponse.json({error:"Choose a valid document scope"},{status:400});
     if(scope.type==="sections"&&(!Array.isArray(scope.sectionIds)||!scope.sectionIds.length))return NextResponse.json({error:"Choose at least one indexed section"},{status:400});
@@ -91,6 +94,11 @@ export async function POST(request: Request) {
     if (!document) return NextResponse.json({ error: "Document not found" }, { status: 404 });
     if (document.processing_status !== "ready") return NextResponse.json({ error: "This document is still processing and is not ready for AI yet" }, { status: 409 });
     await sql`update public.documents set ai_status='generating', ai_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
+    if(mode==="tutor"){
+      if(conversationId){const owned=await sql`select id from public.ai_conversations where id=${conversationId} and user_id=${userId} and document_id=${documentId}`;if(!owned[0])return NextResponse.json({error:"Tutor conversation not found"},{status:404});await sql`update public.ai_conversations set scope_json=${JSON.stringify(scope)}::jsonb,updated_at=now() where id=${conversationId} and user_id=${userId}`}
+      else{const created=await sql`insert into public.ai_conversations(user_id,document_id,title,scope_json)values(${userId},${documentId},${prompt.slice(0,90)},${JSON.stringify(scope)}::jsonb)returning id`;conversationId=String(created[0].id)}
+      await sql`insert into public.ai_messages(conversation_id,user_id,role,content_json,status)values(${conversationId},${userId},'user',${JSON.stringify({text:prompt})}::jsonb,'completed')`;
+    }
 
     let sectionIds:string[]=[];
     if(scope.type==="sections"){
@@ -117,19 +125,34 @@ export async function POST(request: Request) {
     const chunks = chunkRows as unknown as StoredChunk[];
     if (!chunks.length) throw new Error("The document contains no readable text.");
     const name = String(document.original_name);
+    let effectivePrompt=prompt;
+    if(mode==="tutor"&&conversationId){const history=await sql`select role,content_json from public.ai_messages where conversation_id=${conversationId} and user_id=${userId} order by created_at desc limit 12`;effectivePrompt=`Answer the newest question in the same language it was asked. Preserve conversation continuity.\n\nConversation (oldest to newest):\n${history.reverse().map(row=>`${row.role}: ${JSON.stringify(row.content_json)}`).join("\n")}\n\nNewest question: ${prompt}`}
+    const provider=configuredAiProvider();
+    const pending=await sql`insert into public.ai_generations(user_id,document_id,mode,provider,model,prompt,response_json,input_tokens,output_tokens,scope_json,status,conversation_id)values(${userId},${documentId},${mode},${provider.name},${provider.model},${prompt},'{}'::jsonb,0,0,${JSON.stringify(scope)}::jsonb,'generating',${conversationId||null})returning id`;
+    generationId=String(pending[0].id);
     const generation = mode === "summary"
       ? await hierarchicalSummary(name, chunks, prompt)
-      : await configuredAiProvider().generate({ mode, prompt, schema: schemaFor(mode), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
-    await sql`insert into public.ai_generations (user_id, document_id, mode, provider, model, prompt, response_json, input_tokens, output_tokens,scope_json) values (${userId}, ${documentId}, ${mode}, ${generation.provider}, ${generation.model}, ${prompt}, ${JSON.stringify(generation.result)}::jsonb, ${generation.usage.input_tokens}, ${generation.usage.output_tokens},${JSON.stringify(scope)}::jsonb)`;
+      : await provider.generate({ mode, prompt:effectivePrompt, schema: schemaFor(mode), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
+    await sql`update public.ai_generations set provider=${generation.provider},model=${generation.model},response_json=${JSON.stringify(generation.result)}::jsonb,input_tokens=${generation.usage.input_tokens},output_tokens=${generation.usage.output_tokens},status='completed',completed_at=now(),updated_at=now() where id=${generationId} and user_id=${userId}`;
+    if(mode==="tutor"&&conversationId){const citations=Array.isArray(generation.result.citations)?generation.result.citations:[];await sql`insert into public.ai_messages(conversation_id,user_id,role,content_json,citations_json,provider,model,input_tokens,output_tokens,status)values(${conversationId},${userId},'assistant',${JSON.stringify(generation.result)}::jsonb,${JSON.stringify(citations)}::jsonb,${generation.provider},${generation.model},${generation.usage.input_tokens},${generation.usage.output_tokens},'completed')`;await sql`update public.ai_conversations set provider=${generation.provider},model=${generation.model},updated_at=now() where id=${conversationId} and user_id=${userId}`}
     await sql`update public.documents set ai_status='completed', ai_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
-    return NextResponse.json({ result: generation.result, usage: generation.usage, remainingToday: DAILY_LIMIT - usedToday - 1 });
+    return NextResponse.json({ result: generation.result, usage: generation.usage, remainingToday: DAILY_LIMIT - usedToday - 1,conversationId,generationId });
   } catch (error) {
     console.error("AI generation", error);
     const message = error instanceof Error ? error.message : "AI generation failed";
+    if(userId&&generationId){try{const sql=db();await sql`update public.ai_generations set status='error',response_json=${JSON.stringify({error:message})}::jsonb,updated_at=now() where id=${generationId} and user_id=${userId}`}catch{}}
     if (userId && documentId) {
       try { const sql = db(); await sql`update public.documents set ai_status='error', ai_error=${message}, updated_at=now() where id=${documentId} and user_id=${userId}`; }
       catch (statusError) { console.error("AI status update", statusError); }
     }
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function GET(request:Request){
+  const userId=await currentUserId();if(!userId)return NextResponse.json({error:"Unauthorized"},{status:401});await ensureStudySchema();const sql=db(),url=new URL(request.url),conversationId=url.searchParams.get("conversationId");
+  if(conversationId){const conversations=await sql`select id,document_id,title,scope_json,provider,model,created_at,updated_at from public.ai_conversations where id=${conversationId} and user_id=${userId}`;if(!conversations[0])return NextResponse.json({error:"Conversation not found"},{status:404});const messages=await sql`select id,role,content_json,citations_json,provider,model,input_tokens,output_tokens,status,created_at from public.ai_messages where conversation_id=${conversationId} and user_id=${userId} order by created_at`;return NextResponse.json({conversation:conversations[0],messages})}
+  const conversations=await sql`select c.id,c.document_id,c.title,c.scope_json,c.provider,c.model,c.created_at,c.updated_at,d.title as document_title from public.ai_conversations c join public.documents d on d.id=c.document_id and d.user_id=c.user_id where c.user_id=${userId} order by c.updated_at desc limit 30`;
+  const artifacts=await sql`select g.id,g.document_id,g.mode,g.provider,g.model,g.response_json,g.scope_json,g.input_tokens,g.output_tokens,g.status,g.created_at,g.completed_at,d.title as document_title from public.ai_generations g left join public.documents d on d.id=g.document_id and d.user_id=g.user_id where g.user_id=${userId} and g.mode<>'tutor' order by g.created_at desc limit 50`;
+  return NextResponse.json({conversations,artifacts});
 }

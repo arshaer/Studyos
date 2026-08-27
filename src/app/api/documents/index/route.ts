@@ -8,7 +8,7 @@ export async function GET(request:Request){
   const documentId=new URL(request.url).searchParams.get("documentId")||"";const sql=db();
   const documents=await sql`select id,title,page_count,index_confidence,index_version,processing_status from public.documents where id=${documentId} and user_id=${userId} limit 1`;
   if(!documents[0])return NextResponse.json({error:"Document not found"},{status:404});
-  const sections=await sql`select id,parent_id,kind,level,title,order_index,page_start,page_end,confidence,source from public.document_sections where document_id=${documentId} and user_id=${userId} order by order_index`;
+  const sections=await sql`select id,parent_id,kind,level,title,order_index,page_start,page_end,confidence,source,detection_method,confidence_reason from public.document_sections where document_id=${documentId} and user_id=${userId} order by order_index`;
   return NextResponse.json({document:documents[0],sections});
 }
 export async function PATCH(request:Request){
