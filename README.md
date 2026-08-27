@@ -31,7 +31,7 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 - `DATABASE_URL`
 - `BLOB_READ_WRITE_TOKEN`
 - `GEMINI_API_KEY` (required for the default AI provider; server-side only)
-- `GEMINI_MODEL` (optional; defaults to `gemini-2.5-flash`)
+- `GEMINI_MODEL` (optional; defaults to `gemini-3.6-flash`)
 
 Gemini is the default and does not require `OPENAI_API_KEY`. Optional OpenAI support remains available by setting `AI_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL`.
 

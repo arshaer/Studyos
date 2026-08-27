@@ -54,7 +54,7 @@ function errorDetail(payload: Record<string, unknown>) {
 
 class GeminiProvider implements AiProvider {
   readonly name = "gemini" as const;
-  readonly model = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+  readonly model = process.env.GEMINI_MODEL?.trim() || "gemini-3.6-flash";
 
   async generate(request: AiGenerationRequest): Promise<AiGenerationResult> {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
