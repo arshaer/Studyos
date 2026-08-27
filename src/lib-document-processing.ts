@@ -19,7 +19,8 @@ export function inferHeading(line:string,height:number,bodyHeight:number,page:nu
   const chapter=/^(chapter|capitolo|unità|unit|part|parte|sezione|section)\s+[\divxlc]+\b/i.test(title);
   const uppercase=title.length<90&&title===title.toUpperCase()&&/[A-ZÀ-ÖØ-Þ]{3}/.test(title);
   const large=bodyHeight>0&&height>=bodyHeight*1.22;
-  if(!numbered&&!chapter&&!uppercase&&!large)return null;
+  const hierarchicalNumber=Boolean(numbered&&numbered[1].includes("."));
+  if(!chapter&&!uppercase&&!large&&!hierarchicalNumber)return null;
   const level=numbered?numbered[1].split(".").length:(chapter||height>=bodyHeight*1.7?1:height>=bodyHeight*1.4?2:3);
   return{title,page,level:Math.min(4,level),confidence:numbered||chapter ? .92 : large&&uppercase ? .84 : large ? .72 : .64,source:"heuristic"};
 }
