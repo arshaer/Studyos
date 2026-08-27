@@ -79,6 +79,9 @@ export async function POST(request: Request) {
     const prompt = String(body?.prompt || "").trim().slice(0, 4000);
     let conversationId=String(body?.conversationId||"");
     const scope=(body?.scope||{}) as Scope;
+    const detailLevel=String(body?.detailLevel||"").slice(0,30)||null;
+    const language=String(body?.language||"").slice(0,20)||null;
+    const scopeKey=JSON.stringify(scope.type==="sections"?{type:"sections",sectionIds:[...(scope.sectionIds||[])].map(String).sort()}:scope.type==="pages"?{type:"pages",pageStart:Number(scope.pageStart),pageEnd:Number(scope.pageEnd)}:{type:"entire"});
     if(!["entire","sections","pages"].includes(scope.type))return NextResponse.json({error:"Choose a valid document scope"},{status:400});
     if(scope.type==="sections"&&(!Array.isArray(scope.sectionIds)||!scope.sectionIds.length))return NextResponse.json({error:"Choose at least one indexed section"},{status:400});
     if(scope.type==="pages"&&(!(Number(scope.pageStart)>0)||Number(scope.pageEnd)<Number(scope.pageStart)))return NextResponse.json({error:"Choose a valid page range"},{status:400});
@@ -128,7 +131,8 @@ export async function POST(request: Request) {
     let effectivePrompt=prompt;
     if(mode==="tutor"&&conversationId){const history=await sql`select role,content_json from public.ai_messages where conversation_id=${conversationId} and user_id=${userId} order by created_at desc limit 12`;effectivePrompt=`Answer the newest question in the same language it was asked. Preserve conversation continuity.\n\nConversation (oldest to newest):\n${history.reverse().map(row=>`${row.role}: ${JSON.stringify(row.content_json)}`).join("\n")}\n\nNewest question: ${prompt}`}
     const provider=configuredAiProvider();
-    const pending=await sql`insert into public.ai_generations(user_id,document_id,mode,provider,model,prompt,response_json,input_tokens,output_tokens,scope_json,status,conversation_id)values(${userId},${documentId},${mode},${provider.name},${provider.model},${prompt},'{}'::jsonb,0,0,${JSON.stringify(scope)}::jsonb,'generating',${conversationId||null})returning id`;
+    const versionRows=mode==="summary"?await sql`select coalesce(max(version),0)::int+1 as version from public.ai_generations where user_id=${userId} and document_id=${documentId} and mode='summary' and scope_key=${scopeKey}`:[{version:1}];
+    const pending=await sql`insert into public.ai_generations(user_id,document_id,mode,provider,model,prompt,response_json,input_tokens,output_tokens,scope_json,scope_key,version,language,detail_level,status,conversation_id)values(${userId},${documentId},${mode},${provider.name},${provider.model},${prompt},'{}'::jsonb,0,0,${JSON.stringify(scope)}::jsonb,${scopeKey},${versionRows[0].version},${language},${detailLevel},'generating',${conversationId||null})returning id`;
     generationId=String(pending[0].id);
     const generation = mode === "summary"
       ? await hierarchicalSummary(name, chunks, prompt)
@@ -150,9 +154,9 @@ export async function POST(request: Request) {
 }
 
 export async function GET(request:Request){
-  const userId=await currentUserId();if(!userId)return NextResponse.json({error:"Unauthorized"},{status:401});await ensureStudySchema();const sql=db(),url=new URL(request.url),conversationId=url.searchParams.get("conversationId");
+  const userId=await currentUserId();if(!userId)return NextResponse.json({error:"Unauthorized"},{status:401});await ensureStudySchema();const sql=db(),url=new URL(request.url),conversationId=url.searchParams.get("conversationId"),mode=url.searchParams.get("mode"),documentId=url.searchParams.get("documentId"),scopeKey=url.searchParams.get("scopeKey");
   if(conversationId){const conversations=await sql`select id,document_id,title,scope_json,provider,model,created_at,updated_at from public.ai_conversations where id=${conversationId} and user_id=${userId}`;if(!conversations[0])return NextResponse.json({error:"Conversation not found"},{status:404});const messages=await sql`select id,role,content_json,citations_json,provider,model,input_tokens,output_tokens,status,created_at from public.ai_messages where conversation_id=${conversationId} and user_id=${userId} order by created_at`;return NextResponse.json({conversation:conversations[0],messages})}
   const conversations=await sql`select c.id,c.document_id,c.title,c.scope_json,c.provider,c.model,c.created_at,c.updated_at,d.title as document_title from public.ai_conversations c join public.documents d on d.id=c.document_id and d.user_id=c.user_id where c.user_id=${userId} order by c.updated_at desc limit 30`;
-  const artifacts=await sql`select g.id,g.document_id,g.mode,g.provider,g.model,g.response_json,g.scope_json,g.input_tokens,g.output_tokens,g.status,g.created_at,g.completed_at,d.title as document_title from public.ai_generations g left join public.documents d on d.id=g.document_id and d.user_id=g.user_id where g.user_id=${userId} and g.mode<>'tutor' order by g.created_at desc limit 50`;
+  const artifacts=mode&&documentId?await sql`select g.id,g.document_id,g.mode,g.provider,g.model,g.response_json,g.scope_json,g.scope_key,g.version,g.language,g.detail_level,g.input_tokens,g.output_tokens,g.status,g.created_at,g.completed_at,d.title as document_title from public.ai_generations g join public.documents d on d.id=g.document_id and d.user_id=g.user_id where g.user_id=${userId} and g.document_id=${documentId} and g.mode=${mode} and (${scopeKey}::text is null or g.scope_key=${scopeKey}) and g.status='completed' order by g.created_at desc limit 50`:await sql`select g.id,g.document_id,g.mode,g.provider,g.model,g.response_json,g.scope_json,g.scope_key,g.version,g.language,g.detail_level,g.input_tokens,g.output_tokens,g.status,g.created_at,g.completed_at,d.title as document_title from public.ai_generations g left join public.documents d on d.id=g.document_id and d.user_id=g.user_id where g.user_id=${userId} and g.mode<>'tutor' order by g.created_at desc limit 50`;
   return NextResponse.json({conversations,artifacts});
 }

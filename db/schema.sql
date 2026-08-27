@@ -61,6 +61,11 @@ create table if not exists public.ai_messages (
   status text not null default 'completed', created_at timestamptz not null default now()
 );
 alter table public.ai_generations add column if not exists conversation_id uuid references public.ai_conversations(id) on delete set null;
+alter table public.ai_generations add column if not exists scope_key text;
+alter table public.ai_generations add column if not exists version int not null default 1;
+alter table public.ai_generations add column if not exists language text;
+alter table public.ai_generations add column if not exists detail_level text;
+create index if not exists ai_summary_scope_idx on public.ai_generations(user_id,document_id,mode,scope_key,created_at desc);
 create table if not exists public.document_chunks (
   id bigserial primary key,
   document_id uuid not null references public.documents(id) on delete cascade,
@@ -89,3 +94,29 @@ create table if not exists public.document_reading_progress (
   primary key (user_id, document_id)
 );
 create index if not exists document_reading_progress_recent_idx on public.document_reading_progress (user_id, last_opened_at desc);
+create table if not exists public.tutor_profiles (
+  id uuid primary key default gen_random_uuid(), user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
+  target text not null, deadline date not null, hours_per_day numeric(4,2) not null, current_level text not null,
+  studied_section_ids jsonb not null default '[]'::jsonb, weak_section_ids jsonb not null default '[]'::jsonb,
+  study_style text not null default 'mixed', preferred_language text not null default 'it', unavailable_dates jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now(), updated_at timestamptz not null default now(), unique(user_id,document_id)
+);
+create table if not exists public.study_plans (
+  id uuid primary key default gen_random_uuid(), user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
+  profile_id uuid not null references public.tutor_profiles(id) on delete cascade, version int not null default 1,
+  status text not null default 'active', reason text, created_at timestamptz not null default now(), updated_at timestamptz not null default now()
+);
+create table if not exists public.study_plan_tasks (
+  id uuid primary key default gen_random_uuid(), plan_id uuid not null references public.study_plans(id) on delete cascade,
+  user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
+  section_id uuid references public.document_sections(id) on delete set null, task_date date not null, task_type text not null,
+  title text not null, estimated_minutes int not null, order_index int not null, status text not null default 'planned',
+  actual_minutes int not null default 0, score numeric(5,2), completed_at timestamptz, created_at timestamptz not null default now()
+);
+create table if not exists public.section_mastery (
+  user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
+  section_id uuid not null references public.document_sections(id) on delete cascade, reading_percent numeric(5,2) not null default 0,
+  study_seconds int not null default 0, flashcards_reviewed int not null default 0, recall_accuracy numeric(5,2),
+  questions_answered int not null default 0, question_accuracy numeric(5,2), confidence numeric(5,2), updated_at timestamptz not null default now(),
+  primary key(user_id,document_id,section_id)
+);

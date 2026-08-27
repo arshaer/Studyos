@@ -9,7 +9,7 @@ import { DocumentIndexPreview } from "@/components/DocumentIndexPreview";
 
 const PdfReader = dynamic(() => import("@/components/PdfReader"), { ssr: false });
 
-type Section = "dashboard" | "session" | "library" | "tutor" | "summary" | "flashcards" | "questions" | "exams" | "progress";
+type Section = "dashboard" | "session" | "library" | "tutor" | "doubt" | "summary" | "flashcards" | "questions" | "exams" | "progress";
 
 type StudyDocument = {
   id: string;
@@ -71,11 +71,11 @@ function DocumentSelect({ documents, value, onChange }: { documents: StudyDocume
 async function requestAi<T>(mode: string, documentId: string, prompt: string,scope:DocumentScope) {
   return (await requestAiResponse<T>(mode,documentId,prompt,scope)).result;
 }
-async function requestAiResponse<T>(mode:string,documentId:string,prompt:string,scope:DocumentScope,conversationId=""){
+async function requestAiResponse<T>(mode:string,documentId:string,prompt:string,scope:DocumentScope,conversationId="",extra:Record<string,unknown>={}){
   const response = await fetch("/api/ai", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mode, documentId, prompt,scope,conversationId }),
+    body: JSON.stringify({ mode, documentId, prompt,scope,conversationId,...extra }),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "AI generation failed");
@@ -91,6 +91,7 @@ const nav: { id: Section; label: string; icon: string }[] = [
   { id: "session", label: "Study Session", icon: "◷" },
   { id: "library", label: "Library", icon: "▤" },
   { id: "tutor", label: "AI Tutor", icon: "✦" },
+  { id: "doubt", label: "Ask your Notes", icon: "?" },
   { id: "summary", label: "Summary", icon: "≡" },
   { id: "flashcards", label: "Flashcards", icon: "◫" },
   { id: "questions", label: "Questions", icon: "?" },
@@ -284,7 +285,21 @@ function StudySession({ documents, onProgressChange }: { documents: StudyDocumen
   </>
 }
 
-function Tutor({ documents, onStatusChange, openPdf }: { documents: StudyDocument[]; onStatusChange: () => void;openPdf:(document:StudyDocument)=>void }) {
+type CoachTask={id:string;task_date:string;title:string;estimated_minutes:number;actual_minutes:number;status:string;page_start?:number;page_end?:number};
+type CoachData={profile:any;plan:any;tasks:CoachTask[];mastery:any[];metrics:{completion:number;completedMinutes:number;status:string;readiness:number}};
+function Tutor({documents}:{documents:StudyDocument[]}){
+  const[documentId,setDocumentId]=useReadyDocumentId(documents),[data,setData]=useState<CoachData|null>(null),[step,setStep]=useState(0),[busy,setBusy]=useState(false),[error,setError]=useState("");
+  const[setup,setSetup]=useState({target:"written exam",deadline:"",hoursPerDay:2,currentLevel:"beginner",studyStyle:"mixed",preferredLanguage:"it"});
+  async function load(id=documentId){if(!id){setData(null);return}const r=await fetch(`/api/tutor?documentId=${id}`),j=await r.json();if(!r.ok)throw new Error(j.error);setData(j);if(j.profile)setSetup({target:j.profile.target,deadline:String(j.profile.deadline).slice(0,10),hoursPerDay:Number(j.profile.hours_per_day),currentLevel:j.profile.current_level,studyStyle:j.profile.study_style,preferredLanguage:j.profile.preferred_language})}
+  useEffect(()=>{void load().catch(e=>setError(e.message))},[documentId]);
+  async function createPlan(reason="Initial plan"){setBusy(true);setError("");try{const r=await fetch("/api/tutor",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({documentId,...setup,reason})}),j=await r.json();if(!r.ok)throw new Error(j.error);setData(j)}catch(e){setError(e instanceof Error?e.message:"Could not create plan")}finally{setBusy(false)}}
+  async function complete(task:CoachTask){const r=await fetch("/api/tutor",{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({taskId:task.id,completed:task.status!=="completed",actualMinutes:task.estimated_minutes})}),j=await r.json();if(r.ok)setData(j);else setError(j.error)}
+  const today=new Date().toISOString().slice(0,10),todayTasks=data?.tasks.filter(t=>String(t.task_date).slice(0,10)===today)||[],upcoming=data?.tasks.filter(t=>t.status!=="completed").slice(0,8)||[];
+  return <><PageTitle kicker="PERSONAL STUDY COACH" title="Tutor" text="A persistent study mentor that plans from your real indexed syllabus and adapts to completed work."/><div className="panel summary-controls"><label>Course material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label></div>{error&&<div className="upload-error">{error}</div>}
+  {!data?.profile?<div className="panel coach-onboarding"><div className="section-kicker">SETUP {step+1} OF 3</div>{step===0&&<><h2>What are you preparing for?</h2><label>Target<select value={setup.target} onChange={e=>setSetup({...setup,target:e.target.value})}><option>written exam</option><option>oral exam</option><option>understanding</option><option>revision</option></select></label><label>Current level<select value={setup.currentLevel} onChange={e=>setSetup({...setup,currentLevel:e.target.value})}><option>beginner</option><option>intermediate</option><option>strong</option></select></label></>}{step===1&&<><h2>How much time do you really have?</h2><label>Deadline<input type="date" value={setup.deadline} onChange={e=>setSetup({...setup,deadline:e.target.value})}/></label><label>Hours per day<input type="number" min="0.5" max="12" step="0.5" value={setup.hoursPerDay} onChange={e=>setSetup({...setup,hoursPerDay:Number(e.target.value)})}/></label></>}{step===2&&<><h2>How should Tutor teach you?</h2><label>Study style<select value={setup.studyStyle} onChange={e=>setSetup({...setup,studyStyle:e.target.value})}><option>mixed</option><option>active recall</option><option>reading</option><option>flashcards</option><option>oral simulation</option></select></label><label>Language<select value={setup.preferredLanguage} onChange={e=>setSetup({...setup,preferredLanguage:e.target.value})}><option value="it">Italiano</option><option value="en">English</option><option value="fa">فارسی</option></select></label></>}<div className="question-footer"><button className="ghost" disabled={!step} onClick={()=>setStep(step-1)}>Back</button>{step<2?<button className="primary" onClick={()=>setStep(step+1)}>Continue</button>:<button className="primary" disabled={busy||!setup.deadline||!documentId} onClick={()=>void createPlan()}>{busy?"Building…":"Create piano di studio"}</button>}</div></div>:
+  <><div className="metrics-grid"><Metric label="Course completion" value={data.metrics.completion} suffix="%"/><Metric label="Exam readiness" value={data.metrics.readiness} suffix="%"/><Metric label="Completed study" value={data.metrics.completedMinutes} suffix=" min"/><Metric label="Schedule" value={data.metrics.status}/></div><div className="lower-grid"><div className="panel"><div className="panel-head"><div><b>Today's study plan</b><span>Plan v{data.plan?.version} · real indexed sections</span></div></div>{todayTasks.length?todayTasks.map(t=><div className="coach-task" key={t.id}><div><b>{t.title}</b><span>{t.estimated_minutes} min{t.page_start?` · pp. ${t.page_start}–${t.page_end}`:""}</span></div><button onClick={()=>void complete(t)}>{t.status==="completed"?"Undo":"Complete"}</button></div>):<div className="empty-row">No task scheduled today.</div>}</div><div className="panel"><div className="panel-head"><div><b>Next recommended actions</b><span>{data.metrics.status}</span></div><button onClick={()=>void createPlan("User requested re-plan")}>Re-plan</button></div>{upcoming.map(t=><div className="coach-task" key={t.id}><div><b>{t.title}</b><span>{String(t.task_date).slice(0,10)} · {t.estimated_minutes} min</span></div></div>)}</div></div><div className="panel"><div className="panel-head"><div><b>Weak topics</b><span>Only persisted measurements</span></div></div>{data.mastery.length?data.mastery.slice(0,6).map(m=><div className="material-row" key={m.section_id}><div><b>{m.section_title}</b><small>{m.question_accuracy??m.recall_accuracy??m.confidence??"Not assessed"}% mastery</small></div></div>):<div className="empty-row">Complete tasks and assessments to identify weak topics.</div>}</div></>}</>}
+
+function DoubtSolver({ documents, onStatusChange, openPdf }: { documents: StudyDocument[]; onStatusChange: () => void;openPdf:(document:StudyDocument)=>void }) {
   const [message,setMessage]=useState("");
   const [documentId,setDocumentId]=useReadyDocumentId(documents);
   const [result,setResult]=useState<TutorResult | null>(null);
@@ -306,7 +321,7 @@ function Tutor({ documents, onStatusChange, openPdf }: { documents: StudyDocumen
     finally { setLoading(false); onStatusChange(); }
   }
   return <>
-    <PageTitle kicker="ACTIVE LEARNING" title="AI Tutor" text="Ask questions grounded only in your uploaded study material, with source references." />
+    <PageTitle kicker="SOURCE-GROUNDED Q&A" title="Ask your Notes" text="Solve doubts against selected indexed material with citations and follow-up questions." />
     <div className="tutor-grid"><div className="panel lesson-panel">
       <div className="ai-source-row"><label>Source<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><span className="ai-badge">SOURCE-GROUNDED</span></div>
       <DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/>
@@ -324,12 +339,16 @@ function Summary({ documents, onStatusChange }: { documents: StudyDocument[]; on
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
   const [scope,setScope]=useState<DocumentScope>({type:"entire"});
-  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`,scope));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
+  const[history,setHistory]=useState<Array<AiArtifact&{version:number;scope_json:DocumentScope;detail_level?:string}>>([]);
+  const scopeKey=JSON.stringify(scope.type==="sections"?{type:"sections",sectionIds:[...(scope.sectionIds||[])].sort()}:scope.type==="pages"?{type:"pages",pageStart:Number(scope.pageStart),pageEnd:Number(scope.pageEnd)}:{type:"entire"});
+  async function loadHistory(){if(!documentId){setHistory([]);return}const r=await fetch(`/api/ai?mode=summary&documentId=${documentId}&scopeKey=${encodeURIComponent(scopeKey)}`),j=await r.json();const items=j.artifacts||[];setHistory(items);if(items[0]){setResult(items[0].response_json);if(items[0].detail_level)setDepth(items[0].detail_level)}}
+  useEffect(()=>{void loadHistory()},[documentId,scopeKey]);
+  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{const response=await requestAiResponse<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`,scope,"",{detailLevel:depth,language:"auto"});setResult(response.result);await loadHistory();}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
   return <>
   <PageTitle kicker="SOURCE-GROUNDED" title="AI Summary" text="Generate revision notes at the depth you need without losing the structure of the original material." />
   <div className="summary-controls panel"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Depth<select value={depth} onChange={event=>setDepth(event.target.value)}><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate summary"}</button></div><DocumentScopePicker documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/>
   {error&&<div className="upload-error">{error}</div>}
-  <div className="panel article ai-output">{!result&&!loading&&<div className="ai-empty"><b>No summary generated yet</b><span>Select a document and choose the depth.</span></div>}{loading&&<div className="ai-loading">Building your source-grounded summary…</div>}{result&&<><div className="article-top"><span>{depth.toUpperCase()} SUMMARY</span><span>{result.citations.length} source references</span></div><h2>{plainAiText(result.title)}</h2><RichAiText content={result.content}/><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
+  <div className="tutor-grid"><div className="panel article ai-output">{!result&&!loading&&<div className="ai-empty"><b>No summary generated yet</b><span>Select a document and choose the depth.</span></div>}{loading&&<div className="ai-loading">Building your source-grounded summary…</div>}{result&&<><div className="article-top"><span>{depth.toUpperCase()} SUMMARY</span><span>{result.citations.length} source references</span></div><h2>{plainAiText(result.title)}</h2><RichAiText content={result.content}/><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div><div className="panel tutor-side"><div className="panel-head"><div><b>Summary history</b><span>Same document and selected scope</span></div></div><div className="tutor-history">{history.map(item=><button key={item.id} onClick={()=>{setResult(item.response_json);setDepth(item.detail_level||depth)}}><b>Version {item.version} · {item.detail_level||"Summary"}</b><span>{new Date(item.created_at).toLocaleString()}</span></button>)}{!history.length&&<small>No saved version for this scope yet.</small>}</div></div></div>
   </> }
 
 function Flashcards({ documents, onStatusChange }: { documents: StudyDocument[]; onStatusChange: () => void }) {
@@ -495,7 +514,7 @@ export default function StudyApp() {
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Your private workspace</span><b>{progress.documents.ready} AI-ready</b></div></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} retry={retryProcessing} retryingId={retryingId} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} openPdf={setReaderDocument} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} retry={retryProcessing} retryingId={retryingId} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents}/>} {section==="doubt"&&<DoubtSolver documents={documents} openPdf={setReaderDocument} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
     </div></main>
     {readerDocument && <PdfReader document={readerDocument} onClose={() => { setReaderDocument(null); void Promise.all([loadDocuments(), loadProgress()]); }} onProgress={() => void Promise.all([loadDocuments(), loadProgress()])}/>}
   </div>
