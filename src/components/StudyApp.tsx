@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { upload as uploadBlob } from "@vercel/blob/client";
 import dynamic from "next/dynamic";
 import { authClient } from "@/lib-auth";
+import { DocumentScopePicker,type DocumentScope } from "@/components/DocumentScopePicker";
+import { DocumentIndexPreview } from "@/components/DocumentIndexPreview";
 
 const PdfReader = dynamic(() => import("@/components/PdfReader"), { ssr: false });
 
@@ -64,11 +66,11 @@ function DocumentSelect({ documents, value, onChange }: { documents: StudyDocume
   </select>;
 }
 
-async function requestAi<T>(mode: string, documentId: string, prompt: string) {
+async function requestAi<T>(mode: string, documentId: string, prompt: string,scope:DocumentScope) {
   const response = await fetch("/api/ai", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ mode, documentId, prompt }),
+    body: JSON.stringify({ mode, documentId, prompt,scope }),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "AI generation failed");
@@ -181,6 +183,9 @@ function uploadErrorMessage(error: unknown) {
 
 function statusLabel(status: string) {
   if (status === "ready") return "Ready for AI";
+  if (status === "extracting_pages") return "Extracting pages";
+  if (status === "detecting_structure") return "Detecting structure";
+  if (status === "building_index") return "Building index";
   if (status === "processing") return "Processing";
   if (status === "error") return "Processing error";
   return "Uploaded";
@@ -200,10 +205,10 @@ function Library({ documents, upload, retry, retryingId, state, loading, openPdf
       <div className="panel-head"><div><b>Your material</b><span>{documents.length} document{documents.length === 1 ? "" : "s"} in your private library</span></div></div>
       {loading && <div className="library-empty">Loading your library…</div>}
       {!loading && documents.length === 0 && <div className="library-empty"><b>No study material yet.</b><span>Upload a PDF and it will appear here permanently under your account.</span></div>}
-      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small>{d.mime_type === "application/pdf" && <div className="document-reading"><span><i style={{width:`${Math.min(100,Number(d.percent_complete || 0))}%`}}/></span><b>{Math.round(Number(d.percent_complete || 0))}% · Continue page {Number(d.current_page || 1)}</b></div>}</div><div className="state-stack">{d.mime_type === "application/pdf" && <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) > 0 ? "Continue reading" : "Read PDF"}</button>}{d.processing_status === "error" && <button className="read-button" disabled={retryingId === d.id} onClick={() => retry(d.id)}>{retryingId === d.id ? "Retrying…" : "Retry processing"}</button>}<span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
+      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small>{d.mime_type === "application/pdf" && <div className="document-reading"><span><i style={{width:`${Math.min(100,Number(d.percent_complete || 0))}%`}}/></span><b>{Math.round(Number(d.percent_complete || 0))}% · Continue page {Number(d.current_page || 1)}</b></div>}{d.processing_status === "ready" && <DocumentIndexPreview documentId={d.id} pageCount={d.page_count}/>}</div><div className="state-stack">{d.mime_type === "application/pdf" && <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) > 0 ? "Continue reading" : "Read PDF"}</button>}{d.processing_status === "error" && <button className="read-button" disabled={retryingId === d.id} onClick={() => retry(d.id)}>{retryingId === d.id ? "Retrying…" : "Retry processing"}</button>}<span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
     </div></div>
     {state.status === "error" && <div className="upload-error">{state.message}</div>}
-    <div className="panel pipeline"><b>Document and AI states</b><div className="pipeline-flow"><span>Uploaded</span><i>→</i><span>Processing</span><i>→</i><span>Ready for AI</span><i>→</i><span>Generating</span><i>→</i><span>Completed / Error</span></div><small className="pipeline-note">Uploads go directly from your browser to private Vercel Blob storage. Access and ownership are verified on the server.</small></div>
+    <div className="panel pipeline"><b>Document index pipeline</b><div className="pipeline-flow"><span>Extracting pages</span><i>→</i><span>Detecting structure</span><i>→</i><span>Building index</span><i>→</i><span>Ready for AI</span></div><small className="pipeline-note">The file stays private. Gemini receives only text chunks from the scope you choose.</small></div>
   </>
 }
 
@@ -276,10 +281,11 @@ function Tutor({ documents, onStatusChange }: { documents: StudyDocument[]; onSt
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState("");
+  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
   async function ask(prompt=message) {
     if (!documentId || !prompt.trim()) { setError("Choose a document and enter a question."); return; }
     setLoading(true); setError("");
-    try { setResult(await requestAi<AiTextResult>("tutor",documentId,prompt)); setMessage(""); }
+    try { setResult(await requestAi<AiTextResult>("tutor",documentId,prompt,scope)); setMessage(""); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "AI Tutor failed"); }
     finally { setLoading(false); onStatusChange(); }
   }
@@ -287,6 +293,7 @@ function Tutor({ documents, onStatusChange }: { documents: StudyDocument[]; onSt
     <PageTitle kicker="ACTIVE LEARNING" title="AI Tutor" text="Ask questions grounded only in your uploaded study material, with source references." />
     <div className="tutor-grid"><div className="panel lesson-panel">
       <div className="ai-source-row"><label>Source<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><span className="ai-badge">SOURCE-GROUNDED</span></div>
+      <DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/>
       <div className="lesson-body ai-output">{!result && !loading && <div className="ai-empty"><b>Ask your first question</b><span>StudyOS will answer using only the selected file.</span></div>}{loading && <div className="ai-loading">Reading your material and preparing an answer…</div>}{result && <><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
       {result && <div className="quick-actions">{result.followUps.map(item=><button key={item} onClick={()=>void ask(item)}>{item}</button>)}</div>}
       {error && <div className="upload-error">{error}</div>}
@@ -300,10 +307,11 @@ function Summary({ documents, onStatusChange }: { documents: StudyDocument[]; on
   const [depth,setDepth]=useState("Detailed");
   const [result,setResult]=useState<AiTextResult | null>(null);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
+  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  async function generate(){ if(!documentId){setError("Choose study material first.");return;} setLoading(true);setError("");try{setResult(await requestAi<AiTextResult>("summary",documentId,`${depth} depth. Preserve the original structure and emphasize exam-relevant concepts.`,scope));}catch(reason){setError(reason instanceof Error?reason.message:"Summary failed");}finally{setLoading(false);onStatusChange();} }
   return <>
   <PageTitle kicker="SOURCE-GROUNDED" title="AI Summary" text="Generate revision notes at the depth you need without losing the structure of the original material." />
-  <div className="summary-controls panel"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Coverage<select><option>Entire document</option></select></label><label>Depth<select value={depth} onChange={event=>setDepth(event.target.value)}><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate summary"}</button></div>
+  <div className="summary-controls panel"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Depth<select value={depth} onChange={event=>setDepth(event.target.value)}><option>Detailed</option><option>Standard</option><option>Quick</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate summary"}</button></div><DocumentScopePicker documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/>
   {error&&<div className="upload-error">{error}</div>}
   <div className="panel article ai-output">{!result&&!loading&&<div className="ai-empty"><b>No summary generated yet</b><span>Select a document and choose the depth.</span></div>}{loading&&<div className="ai-loading">Building your source-grounded summary…</div>}{result&&<><div className="article-top"><span>{depth.toUpperCase()} SUMMARY</span><span>{result.citations.length} source references</span></div><h2>{result.title}</h2><p>{result.content}</p><div className="citation-list">{result.citations.map(source=><span className="source-chip" key={source}>{source}</span>)}</div></>}</div>
   </> }
@@ -312,19 +320,21 @@ function Flashcards({ documents, onStatusChange }: { documents: StudyDocument[];
   const [index,setIndex]=useState(0); const [flip,setFlip]=useState(false);
   const [documentId,setDocumentId]=useReadyDocumentId(documents); const [cards,setCards]=useState<AiCard[]>([]);
   const [title,setTitle]=useState("Generated deck"); const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>("flashcards",documentId,"Focus on high-yield concepts and common misconceptions.");setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);onStatusChange();}}
+  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiCard[]}>("flashcards",documentId,"Focus on high-yield concepts and common misconceptions.",scope);setCards(data.items);setTitle(data.title);setIndex(0);setFlip(false);}catch(reason){setError(reason instanceof Error?reason.message:"Flashcards failed");}finally{setLoading(false);onStatusChange();}}
   const card=cards[index];
-  return <><PageTitle kicker="ACTIVE RECALL" title="Flashcards" text="Generate source-grounded cards directly from your own notes." /><div className="flash-layout"><div className="panel deck-info"><b>{title}</b><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate 10 cards"}</button><small>{cards.length?`${cards.length} cards ready`:`Select a source to create a deck.`}</small></div>{error&&<div className="upload-error">{error}</div>}{card?<><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>SOURCE-GROUNDED</span><span>{index+1} / {cards.length}</span></div><h2>{flip?card.back:card.front}</h2><span className="tap-hint">{flip?card.citation:"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></>:<div className="panel ai-empty"><b>No cards yet</b><span>Generate a new deck from an uploaded document.</span></div>}</div></>
+  return <><PageTitle kicker="ACTIVE RECALL" title="Flashcards" text="Generate source-grounded cards directly from your own notes." /><div className="flash-layout"><div className="panel deck-info"><b>{title}</b><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":"Generate 10 cards"}</button><small>{cards.length?`${cards.length} cards ready`:`Select a source to create a deck.`}</small></div>{error&&<div className="upload-error">{error}</div>}{card?<><div className={`flashcard ${flip?"flipped":""}`} onClick={()=>setFlip(!flip)}><div className="flash-meta"><span>SOURCE-GROUNDED</span><span>{index+1} / {cards.length}</span></div><h2>{flip?card.back:card.front}</h2><span className="tap-hint">{flip?card.citation:"Tap to reveal answer"}</span></div><div className="ratings">{["Again","Hard","Good","Easy"].map(x=><button key={x} onClick={()=>{setFlip(false);setIndex((index+1)%cards.length)}}>{x}</button>)}</div></>:<div className="panel ai-empty"><b>No cards yet</b><span>Generate a new deck from an uploaded document.</span></div>}</div></>
 }
 
 function Questions({ documents, exams=false, onStatusChange }: { documents: StudyDocument[]; exams?: boolean; onStatusChange: () => void }) {
   const [submitted,setSubmitted]=useState(false); const [answer,setAnswer]=useState(""); const [index,setIndex]=useState(0);
   const [documentId,setDocumentId]=useReadyDocumentId(documents); const [questions,setQuestions]=useState<AiQuestion[]>([]);
   const [loading,setLoading]=useState(false); const [error,setError]=useState("");
-  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>("questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.");setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);onStatusChange();}}
+  const [scope,setScope]=useState<DocumentScope>({type:"sections",sectionIds:[]});
+  async function generate(){if(!documentId){setError("Choose study material first.");return;}setLoading(true);setError("");try{const data=await requestAi<{title:string;items:AiQuestion[]}>("questions",documentId,exams?"Use mixed difficulty and exam-style distractors.":"Prioritize active recall and concise explanations.",scope);setQuestions(data.items);setIndex(0);setAnswer("");setSubmitted(false);}catch(reason){setError(reason instanceof Error?reason.message:"Question generation failed");}finally{setLoading(false);onStatusChange();}}
   const question=questions[index];
   return <><PageTitle kicker={exams?"SIMULATION":"ACTIVE RECALL"} title={exams?"Exam Simulator":"Questions"} text={exams?"Simulate the real exam and measure readiness by topic.":"Upload existing question banks or generate questions directly from selected study material."} />
-  <div className="panel exam-builder"><div className="builder-row"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><label>Type<select><option>Multiple Choice</option></select></label><label>Difficulty<select><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":exams?"Build exam":"Generate questions"}</button></div></div>
+  <div className="panel exam-builder"><div className="builder-row"><label>Material<DocumentSelect documents={documents} value={documentId} onChange={setDocumentId}/></label><DocumentScopePicker compact documentId={documentId} pageCount={documents.find(d=>d.id===documentId)?.page_count} value={scope} onChange={setScope}/><label>Type<select><option>Multiple Choice</option></select></label><label>Difficulty<select><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></label><button className="primary" disabled={loading} onClick={()=>void generate()}>{loading?"Generating…":exams?"Build exam":"Generate questions"}</button></div></div>
   {error&&<div className="upload-error">{error}</div>}
   {question?<div className="panel question-card"><div className="question-top"><span>QUESTION {index+1} OF {questions.length}</span><span>SOURCE-GROUNDED</span></div><h2>{question.question}</h2>{question.options.map((option,i)=><label className={`option ${answer===option?"selected":""}`} key={option}><input type="radio" name="q" value={option} checked={answer===option} onChange={()=>setAnswer(option)}/><span>{String.fromCharCode(65+i)}</span>{option}</label>)}<div className="question-footer"><button className="ghost" disabled={index===0} onClick={()=>{setIndex(index-1);setSubmitted(false);setAnswer("");}}>Previous</button><button className="primary" disabled={!answer} onClick={()=>setSubmitted(true)}>Check answer</button></div>{submitted&&<div className={`result ${answer===question.answer?"correct":"wrong"}`}><b>{answer===question.answer?"Correct":"Review this concept"}</b><span>{question.explanation}</span><small>{question.citation}</small><button className="ghost" disabled={index>=questions.length-1} onClick={()=>{setIndex(index+1);setSubmitted(false);setAnswer("");}}>Next question</button></div>}</div>:<div className="panel ai-empty"><b>No questions generated yet</b><span>Choose a document to build a source-grounded practice set.</span></div>}</>
 }

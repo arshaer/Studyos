@@ -11,6 +11,7 @@ const DAILY_LIMIT = 40;
 const CONTEXT_CHUNKS = 16;
 const MAP_GROUP_CHARACTERS = 90_000;
 const modes = new Set(["tutor", "summary", "flashcards", "questions"]);
+type Scope={type:"entire"|"sections"|"pages";sectionIds?:string[];pageStart?:number;pageEnd?:number};
 
 function schemaFor(mode: AiMode) {
   if (mode === "flashcards") return { type: "object", properties: { title: { type: "string", description: "Short deck title in the learner's language" }, items: { type: "array", minItems: 10, maxItems: 10, items: { type: "object", properties: { front: { type: "string" }, back: { type: "string" }, citation: { type: "string", description: "One exact SOURCE label supplied in the context" } }, required: ["front", "back", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
@@ -74,6 +75,10 @@ export async function POST(request: Request) {
     const mode = String(body?.mode || "tutor") as AiMode;
     documentId = String(body?.documentId || "").trim();
     const prompt = String(body?.prompt || "").trim().slice(0, 4000);
+    const scope=(body?.scope||{}) as Scope;
+    if(!["entire","sections","pages"].includes(scope.type))return NextResponse.json({error:"Choose a valid document scope"},{status:400});
+    if(scope.type==="sections"&&(!Array.isArray(scope.sectionIds)||!scope.sectionIds.length))return NextResponse.json({error:"Choose at least one indexed section"},{status:400});
+    if(scope.type==="pages"&&(!(Number(scope.pageStart)>0)||Number(scope.pageEnd)<Number(scope.pageStart)))return NextResponse.json({error:"Choose a valid page range"},{status:400});
     if (!modes.has(mode) || !documentId || (mode === "tutor" && !prompt)) return NextResponse.json({ error: "Choose a document and enter a valid request" }, { status: 400 });
 
     await ensureStudySchema();
@@ -87,18 +92,27 @@ export async function POST(request: Request) {
     if (document.processing_status !== "ready") return NextResponse.json({ error: "This document is still processing and is not ready for AI yet" }, { status: 409 });
     await sql`update public.documents set ai_status='generating', ai_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
 
-    let chunkRows = mode === "summary"
-      ? await sql`select chunk_index, content, page_start, page_end, section from public.document_chunks where document_id=${documentId} and user_id=${userId} order by chunk_index`
-      : prompt
-        ? await sql`select chunk_index, content, page_start, page_end, section from public.document_chunks where document_id=${documentId} and user_id=${userId} order by ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', ${prompt})) desc, chunk_index limit ${CONTEXT_CHUNKS}`
-        : await sql`select chunk_index, content, page_start, page_end, section from public.document_chunks where document_id=${documentId} and user_id=${userId} order by chunk_index limit ${CONTEXT_CHUNKS}`;
+    let sectionIds:string[]=[];
+    if(scope.type==="sections"){
+      const selected=scope.sectionIds!.map(String);
+      const rows=await sql`with recursive tree as (select id from public.document_sections where document_id=${documentId} and user_id=${userId} and id=any(${selected}::uuid[]) union all select s.id from public.document_sections s join tree t on s.parent_id=t.id where s.document_id=${documentId} and s.user_id=${userId}) select distinct id from tree`;
+      sectionIds=rows.map(row=>String(row.id));if(!sectionIds.length)return NextResponse.json({error:"Selected sections were not found"},{status:404});
+    }
+    const allChunks=scope.type==="entire"
+      ? await sql`select chunk_index,content,page_start,page_end,section,section_id,char_start,char_end from public.document_chunks where document_id=${documentId} and user_id=${userId} order by chunk_index`
+      : scope.type==="sections"
+        ? await sql`select chunk_index,content,page_start,page_end,section,section_id,char_start,char_end from public.document_chunks where document_id=${documentId} and user_id=${userId} and section_id=any(${sectionIds}::uuid[]) order by chunk_index`
+        : await sql`select chunk_index,content,page_start,page_end,section,section_id,char_start,char_end from public.document_chunks where document_id=${documentId} and user_id=${userId} and page_start<=${Number(scope.pageEnd)} and page_end>=${Number(scope.pageStart)} order by chunk_index`;
+    let chunkRows=allChunks;
+    if(mode!=="summary"&&prompt&&allChunks.length>CONTEXT_CHUNKS){
+      const allowed=(allChunks as Array<{chunk_index:number}>).map(row=>row.chunk_index);
+      chunkRows=await sql`select chunk_index,content,page_start,page_end,section,section_id,char_start,char_end from public.document_chunks where document_id=${documentId} and user_id=${userId} and chunk_index=any(${allowed}::int[]) order by ts_rank_cd(to_tsvector('simple',content),plainto_tsquery('simple',${prompt})) desc,chunk_index limit ${CONTEXT_CHUNKS}`;
+    }
     if (!chunkRows.length) {
       const { processDocument } = await import("@/lib-document-processing");
       await sql`update public.documents set processing_status='processing', processing_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
       await processDocument(documentId, userId);
-      chunkRows = mode === "summary"
-        ? await sql`select chunk_index, content, page_start, page_end, section from public.document_chunks where document_id=${documentId} and user_id=${userId} order by chunk_index`
-        : await sql`select chunk_index, content, page_start, page_end, section from public.document_chunks where document_id=${documentId} and user_id=${userId} order by chunk_index limit ${CONTEXT_CHUNKS}`;
+      return NextResponse.json({error:"The document index was rebuilt. Choose the scope again."},{status:409});
     }
     const chunks = chunkRows as unknown as StoredChunk[];
     if (!chunks.length) throw new Error("The document contains no readable text.");
@@ -106,7 +120,7 @@ export async function POST(request: Request) {
     const generation = mode === "summary"
       ? await hierarchicalSummary(name, chunks, prompt)
       : await configuredAiProvider().generate({ mode, prompt, schema: schemaFor(mode), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
-    await sql`insert into public.ai_generations (user_id, document_id, mode, provider, model, prompt, response_json, input_tokens, output_tokens) values (${userId}, ${documentId}, ${mode}, ${generation.provider}, ${generation.model}, ${prompt}, ${JSON.stringify(generation.result)}::jsonb, ${generation.usage.input_tokens}, ${generation.usage.output_tokens})`;
+    await sql`insert into public.ai_generations (user_id, document_id, mode, provider, model, prompt, response_json, input_tokens, output_tokens,scope_json) values (${userId}, ${documentId}, ${mode}, ${generation.provider}, ${generation.model}, ${prompt}, ${JSON.stringify(generation.result)}::jsonb, ${generation.usage.input_tokens}, ${generation.usage.output_tokens},${JSON.stringify(scope)}::jsonb)`;
     await sql`update public.documents set ai_status='completed', ai_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
     return NextResponse.json({ result: generation.result, usage: generation.usage, remainingToday: DAILY_LIMIT - usedToday - 1 });
   } catch (error) {

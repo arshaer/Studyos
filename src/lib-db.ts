@@ -39,7 +39,46 @@ export function ensureStudySchema() {
       await sql`alter table public.documents add column if not exists ai_status text not null default 'idle'`;
       await sql`alter table public.documents add column if not exists ai_error text`;
       await sql`alter table public.documents add column if not exists updated_at timestamptz not null default now()`;
+      await sql`alter table public.documents add column if not exists index_confidence numeric(4,3)`;
+      await sql`alter table public.documents add column if not exists index_version int not null default 1`;
       await sql`create index if not exists documents_user_created_idx on public.documents (user_id, created_at desc)`;
+      await sql`
+        create table if not exists public.document_pages (
+          id bigserial primary key,
+          document_id uuid not null references public.documents(id) on delete cascade,
+          user_id text not null,
+          page_number int not null,
+          content text not null,
+          char_start int not null,
+          char_end int not null,
+          created_at timestamptz not null default now(),
+          unique (document_id, page_number)
+        )
+      `;
+      await sql`create index if not exists document_pages_owner_idx on public.document_pages (user_id, document_id, page_number)`;
+      await sql`
+        create table if not exists public.document_sections (
+          id uuid primary key default gen_random_uuid(),
+          document_id uuid not null references public.documents(id) on delete cascade,
+          user_id text not null,
+          parent_id uuid references public.document_sections(id) on delete cascade,
+          kind text not null,
+          level int not null default 1,
+          title text not null,
+          order_index int not null,
+          page_start int not null,
+          page_end int not null,
+          char_start int not null,
+          char_end int not null,
+          confidence numeric(4,3),
+          source text not null default 'heuristic',
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now(),
+          unique (document_id, order_index)
+        )
+      `;
+      await sql`create index if not exists document_sections_owner_idx on public.document_sections (user_id, document_id, order_index)`;
+      await sql`create index if not exists document_sections_parent_idx on public.document_sections (document_id, parent_id, order_index)`;
       await sql`
         create table if not exists public.document_chunks (
           id bigserial primary key,
@@ -50,11 +89,19 @@ export function ensureStudySchema() {
           page_start int,
           page_end int,
           section text,
+          section_id uuid references public.document_sections(id) on delete set null,
+          char_start int,
+          char_end int,
+          token_estimate int,
           char_count int not null,
           created_at timestamptz not null default now(),
           unique (document_id, chunk_index)
         )
       `;
+      await sql`alter table public.document_chunks add column if not exists section_id uuid references public.document_sections(id) on delete set null`;
+      await sql`alter table public.document_chunks add column if not exists char_start int`;
+      await sql`alter table public.document_chunks add column if not exists char_end int`;
+      await sql`alter table public.document_chunks add column if not exists token_estimate int`;
       await sql`create index if not exists document_chunks_owner_idx on public.document_chunks (user_id, document_id, chunk_index)`;
       await sql`
         create table if not exists public.document_reading_progress (
@@ -112,6 +159,7 @@ export function ensureStudySchema() {
         )
       `;
       await sql`alter table public.ai_generations add column if not exists provider text not null default 'openai'`;
+      await sql`alter table public.ai_generations add column if not exists scope_json jsonb`;
       await sql`create index if not exists ai_generations_user_created_idx on public.ai_generations (user_id, created_at desc)`;
     })().catch((error) => {
       schemaReady = null;
