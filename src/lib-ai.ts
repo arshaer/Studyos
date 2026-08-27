@@ -50,6 +50,27 @@ function strictJsonInstruction(schema: Record<string, unknown>, citations: strin
   ].join("\n");
 }
 
+function plainTextInstruction(citations: string[]) {
+  return [
+    "Return a complete, readable response as plain text, not JSON and not a markdown code fence.",
+    citations.length
+      ? `Cite supporting locations by writing these exact SOURCE labels verbatim: ${JSON.stringify(citations)}.`
+      : "State clearly when the source does not contain a verifiable answer.",
+    "Never invent, approximate, translate, or alter a SOURCE label.",
+  ].join("\n");
+}
+
+function textResult(mode: "tutor" | "summary", text: string, citations: string[]) {
+  const content = text.trim().replace(/^```(?:text|markdown)?\s*/i, "").replace(/\s*```$/, "");
+  if (!content) throw new StructuredOutputError("Gemini returned an empty plain-text fallback");
+  return {
+    title: mode === "summary" ? "Summary" : "Answer",
+    content,
+    citations: citations.filter((citation) => content.includes(citation)),
+    followUps: [],
+  };
+}
+
 export class StructuredOutputError extends Error {
   constructor(message: string) {
     super(message);
@@ -146,7 +167,7 @@ class GeminiProvider implements AiProvider {
           },
         };
     const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
-    const call = async (repair?: string) => {
+    const call = async (repair?: string, plainText = false) => {
       const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`,
       {
@@ -154,7 +175,7 @@ class GeminiProvider implements AiProvider {
         headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-          contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}\n\n${strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
+          contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}\n\n${plainText ? plainTextInstruction(request.allowedCitations || []) : strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
           generationConfig: {
             maxOutputTokens: request.mode === "summary" ? 8192 : 4096,
           },
@@ -181,9 +202,21 @@ class GeminiProvider implements AiProvider {
     try { parsed = parseStructuredOutput(first.text, effectiveSchema); }
     catch (error) {
       if (!(error instanceof StructuredOutputError)) throw error;
-      const retry = await call(`${error.message}. Return a fresh, complete JSON value matching the supplied response schema. Use only SOURCE labels present in the document; do not invent citations.`);
+      const textMode = request.mode === "tutor" || request.mode === "summary";
+      const retry = await call(
+        textMode
+          ? `${error.message}. Answer the original request completely in plain text and include only exact SOURCE labels that support it.`
+          : `${error.message}. Return a fresh, complete JSON value matching the supplied response schema. Use only SOURCE labels present in the document; do not invent citations.`,
+        textMode,
+      );
       totalUsage = { input_tokens: first.usage.input_tokens + retry.usage.input_tokens, output_tokens: first.usage.output_tokens + retry.usage.output_tokens };
-      try { parsed = parseStructuredOutput(retry.text, effectiveSchema); }
+      try {
+        parsed = textMode
+          ? textResult(request.mode as "tutor" | "summary", retry.text, request.allowedCitations || [])
+          : parseStructuredOutput(retry.text, effectiveSchema);
+        const issues = validateSchema(parsed, effectiveSchema);
+        if (issues.length) throw new StructuredOutputError(`Gemini fallback failed validation: ${issues.slice(0, 4).join("; ")}`);
+      }
       catch (retryError) {
         const detail = retryError instanceof Error ? retryError.message : "unknown validation error";
         throw new StructuredOutputError(`Gemini structured output could not be recovered after one retry (${detail}; finish reason: ${retry.finishReason})`);
