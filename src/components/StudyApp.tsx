@@ -193,14 +193,14 @@ function aiStatusLabel(status: StudyDocument["ai_status"]) {
   return "No AI actions yet";
 }
 
-function Library({ documents, upload, state, loading, openPdf }: { documents: StudyDocument[]; upload: (f: File) => void; state: UploadState; loading: boolean; openPdf: (document: StudyDocument) => void }) {
+function Library({ documents, upload, retry, retryingId, state, loading, openPdf }: { documents: StudyDocument[]; upload: (f: File) => void; retry: (documentId: string) => void; retryingId: string | null; state: UploadState; loading: boolean; openPdf: (document: StudyDocument) => void }) {
   return <>
     <PageTitle kicker="KNOWLEDGE BASE" title="Study Library" text="Upload course material once. Every AI study mode will use it as the primary source of truth." />
     <div className="library-layout"><UploadCard onUpload={upload} state={state} /><div className="panel file-list">
       <div className="panel-head"><div><b>Your material</b><span>{documents.length} document{documents.length === 1 ? "" : "s"} in your private library</span></div></div>
       {loading && <div className="library-empty">Loading your library…</div>}
       {!loading && documents.length === 0 && <div className="library-empty"><b>No study material yet.</b><span>Upload a PDF and it will appear here permanently under your account.</span></div>}
-      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small>{d.mime_type === "application/pdf" && <div className="document-reading"><span><i style={{width:`${Math.min(100,Number(d.percent_complete || 0))}%`}}/></span><b>{Math.round(Number(d.percent_complete || 0))}% · Continue page {Number(d.current_page || 1)}</b></div>}</div><div className="state-stack">{d.mime_type === "application/pdf" && <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) > 0 ? "Continue reading" : "Read PDF"}</button>}<span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
+      {documents.map((d)=><div className="material-row" key={d.id}><span className="doc-icon">{d.mime_type === "application/pdf" ? "PDF" : "FILE"}</span><div><b>{d.title}</b><small>{formatBytes(d.size_bytes)} · {new Date(d.created_at).toLocaleDateString()}{d.processing_error ? ` · ${d.processing_error}` : d.ai_error ? ` · ${d.ai_error}` : ""}</small>{d.mime_type === "application/pdf" && <div className="document-reading"><span><i style={{width:`${Math.min(100,Number(d.percent_complete || 0))}%`}}/></span><b>{Math.round(Number(d.percent_complete || 0))}% · Continue page {Number(d.current_page || 1)}</b></div>}</div><div className="state-stack">{d.mime_type === "application/pdf" && <button className="read-button" onClick={() => openPdf(d)}>{Number(d.percent_complete || 0) > 0 ? "Continue reading" : "Read PDF"}</button>}{d.processing_status === "error" && <button className="read-button" disabled={retryingId === d.id} onClick={() => retry(d.id)}>{retryingId === d.id ? "Retrying…" : "Retry processing"}</button>}<span className={`status ${d.processing_status === "ready" ? "good" : d.processing_status === "error" ? "bad" : ""}`}>{statusLabel(d.processing_status)}</span><span className={`status ${d.ai_status === "completed" ? "good" : d.ai_status === "error" ? "bad" : ""}`}>{aiStatusLabel(d.ai_status)}</span></div></div>)}
     </div></div>
     {state.status === "error" && <div className="upload-error">{state.message}</div>}
     <div className="panel pipeline"><b>Document and AI states</b><div className="pipeline-flow"><span>Uploaded</span><i>→</i><span>Processing</span><i>→</i><span>Ready for AI</span><i>→</i><span>Generating</span><i>→</i><span>Completed / Error</span></div><small className="pipeline-note">Uploads go directly from your browser to private Vercel Blob storage. Access and ownership are verified on the server.</small></div>
@@ -347,6 +347,7 @@ export default function StudyApp() {
   const [progress,setProgress]=useState<ProgressData>(EMPTY_PROGRESS);
   const [libraryLoading,setLibraryLoading]=useState(true);
   const [uploadState,setUploadState]=useState<UploadState>({status:"idle"});
+  const [retryingId,setRetryingId]=useState<string | null>(null);
   const [collapsed,setCollapsed]=useState(false);
   const [signingOut,setSigningOut]=useState(false);
   const [readerDocument,setReaderDocument]=useState<StudyDocument | null>(null);
@@ -387,6 +388,29 @@ export default function StudyApp() {
   }
 
   useEffect(() => { void Promise.all([loadDocuments(), loadProgress()]); }, [userId]);
+
+  async function retryProcessing(documentId: string) {
+    setRetryingId(documentId);
+    setDocuments(current => current.map(document => document.id === documentId
+      ? { ...document, processing_status: "processing", processing_error: null }
+      : document));
+    try {
+      const response = await fetch("/api/documents", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "process", documentId }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Document processing failed");
+      setDocuments(current => current.map(document => document.id === documentId ? data.document : document));
+      void loadProgress();
+    } catch (error) {
+      console.error("document retry failed", error);
+      await loadDocuments();
+    } finally {
+      setRetryingId(null);
+    }
+  }
 
   async function handleUpload(file: File) {
     if (!userId) return;
@@ -445,7 +469,7 @@ export default function StudyApp() {
   return <div className={`app ${collapsed?"collapsed":""}`}>
     <aside className="sidebar"><div className="brand"><div className="brand-mark">S</div><div><b>StudyOS</b><span>AI Learning System</span></div></div><nav>{nav.map(x=><button key={x.id} className={section===x.id?"active":""} onClick={()=>setSection(x.id)}><span>{x.icon}</span><b>{x.label}</b></button>)}</nav><div className="sidebar-bottom"><button className="upload-small" onClick={()=>setSection("library")}><span>＋</span><b>Upload material</b></button><div className="profile"><span>{initials}</span><div><b>{userName}</b><small>Signed in</small></div></div><button className="signout" onClick={()=>void handleSignOut()} disabled={signingOut}><span>↪</span><b>{signingOut?"Logging out…":"Log out"}</b></button></div></aside>
     <main><header><button className="collapse" onClick={()=>setCollapsed(!collapsed)}>☰</button><span className="mobile-title">{title}</span><div className="header-actions"><div className="global-progress"><span>Your private workspace</span><b>{progress.documents.ready} AI-ready</b></div></div></header><div className="content">
-      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
+      {section==="dashboard"&&<Dashboard go={setSection} documents={documents} progress={progress} openPdf={setReaderDocument}/>} {section==="session"&&<StudySession documents={documents} onProgressChange={()=>void loadProgress()}/>} {section==="library"&&<Library documents={documents} upload={handleUpload} retry={retryProcessing} retryingId={retryingId} state={uploadState} loading={libraryLoading} openPdf={setReaderDocument}/>} {section==="tutor"&&<Tutor documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="summary"&&<Summary documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="flashcards"&&<Flashcards documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="questions"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])}/>} {section==="exams"&&<Questions documents={documents} onStatusChange={()=>void Promise.all([loadDocuments(),loadProgress()])} exams/>} {section==="progress"&&<Progress progress={progress}/>}
     </div></main>
     {readerDocument && <PdfReader document={readerDocument} onClose={() => { setReaderDocument(null); void Promise.all([loadDocuments(), loadProgress()]); }} onProgress={() => void Promise.all([loadDocuments(), loadProgress()])}/>}
   </div>

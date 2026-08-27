@@ -20,24 +20,31 @@ function splitPart(part: ExtractedPart) {
 }
 
 async function extractPdf(bytes: Uint8Array): Promise<ExtractedPart[]> {
-  // pdfjs needs these globals even for text-only extraction. Making the native
-  // canvas package explicit prevents Vercel from pruning pdfjs' optional runtime.
-  if (!globalThis.DOMMatrix || !globalThis.Path2D) {
-    const canvas = await import("@napi-rs/canvas");
-    globalThis.DOMMatrix ??= canvas.DOMMatrix as unknown as typeof DOMMatrix;
-    globalThis.Path2D ??= canvas.Path2D as unknown as typeof Path2D;
-  }
-  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const pdf = await getDocument({ data: bytes }).promise;
+  // unpdf's default PDF.js build is compiled for serverless runtimes and has its
+  // worker inlined. Do not swap this for pdfjs-dist: its Node fallback dynamically
+  // imports pdf.worker.mjs, which is not present in Next.js' Vercel function output.
+  const { getDocumentProxy } = await import("unpdf");
+  const pdf = await getDocumentProxy(bytes, {
+    disableFontFace: true,
+    useSystemFonts: false,
+    maxImageSize: 16_777_216,
+  });
   const pages: ExtractedPart[] = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
-    const content = await page.getTextContent();
-    const text = content.items.map((item) => "str" in item ? item.str : "").join(" ");
-    if (text.trim()) pages.push({ text, page: pageNumber, section: `Page ${pageNumber}` });
-    page.cleanup();
+  try {
+    // Process sequentially so large PDFs do not fan every page out in memory at once.
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      try {
+        const content = await page.getTextContent();
+        const text = content.items.map((item) => "str" in item ? item.str : "").join(" ");
+        if (text.trim()) pages.push({ text, page: pageNumber, section: `Page ${pageNumber}` });
+      } finally {
+        page.cleanup();
+      }
+    }
+  } finally {
+    await pdf.cleanup();
   }
-  await pdf.cleanup();
   return pages;
 }
 
