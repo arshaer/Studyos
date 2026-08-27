@@ -145,7 +145,8 @@ class GeminiProvider implements AiProvider {
           contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
           generationConfig: {
             maxOutputTokens: request.mode === "summary" ? 8192 : 4096,
-            responseFormat: { text: { mimeType: "application/json", schema: effectiveSchema } },
+            responseMimeType: "application/json",
+            responseJsonSchema: effectiveSchema,
           },
         }),
         signal: AbortSignal.timeout(55_000),

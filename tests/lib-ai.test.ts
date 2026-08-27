@@ -36,7 +36,7 @@ test("rejects a multiple-choice answer not present in options", () => {
   assert.throws(() => parseStructuredOutput(JSON.stringify({ items: [{ options: ["A", "B"], answer: "C" }] }), schema), StructuredOutputError);
 });
 
-test("Gemini sends the current responseFormat schema and repairs once", async () => {
+test("Gemini generateContent sends native MIME/schema fields and repairs once", async () => {
   process.env.AI_PROVIDER = "gemini";
   process.env.GEMINI_API_KEY = "test-only";
   const originalFetch = globalThis.fetch;
@@ -60,8 +60,15 @@ test("Gemini sends the current responseFormat schema and repairs once", async ()
     assert.deepEqual(result.usage, { input_tokens: 20, output_tokens: 10 });
     assert.equal(bodies.length, 2);
     const config = bodies[0].generationConfig as Record<string, unknown>;
-    assert.ok(config.responseFormat);
-    assert.equal(config.responseJsonSchema, undefined);
+    assert.equal(config.responseMimeType, "application/json");
+    assert.deepEqual(config.responseJsonSchema, {
+      ...tutorSchema,
+      properties: {
+        ...tutorSchema.properties,
+        citations: { type: "array", items: { type: "string", enum: ["notes.pdf · page 2"] } },
+      },
+    });
+    assert.equal(config.responseFormat, undefined);
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
