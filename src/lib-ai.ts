@@ -28,6 +28,50 @@ type AiProvider = {
   generate(request: AiGenerationRequest): Promise<AiGenerationResult>;
 };
 
+export type AiErrorKind = "rate_limit" | "unavailable" | "timeout" | "auth" | "structured_output" | "unknown";
+
+export class AiProviderError extends Error {
+  readonly kind: AiErrorKind;
+  readonly options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown };
+  constructor(kind: AiErrorKind, message: string, options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown }) {
+    super(message, { cause: options.cause });
+    this.name = "AiProviderError";
+    this.kind = kind;
+    this.options = options;
+  }
+}
+
+export function retryDelayMs(payload: Record<string, unknown>, retryAfter?: string | null) {
+  const headerSeconds = retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter.trim()) ? Number(retryAfter) * 1000 : NaN;
+  if (Number.isFinite(headerSeconds)) return Math.max(0, headerSeconds);
+  if (retryAfter) { const dateMs = Date.parse(retryAfter); if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now()); }
+  const error = payload.error && typeof payload.error === "object" ? payload.error as { details?: unknown } : undefined;
+  for (const detail of Array.isArray(error?.details) ? error.details : []) {
+    if (!detail || typeof detail !== "object") continue;
+    const match = String((detail as { retryDelay?: unknown }).retryDelay || "").trim().match(/^(\d+(?:\.\d+)?)s$/);
+    if (match) return Math.max(0, Number(match[1]) * 1000);
+  }
+  return undefined;
+}
+
+function providerError(provider: AiGenerationResult["provider"], response: Response, payload: Record<string, unknown>) {
+  const status = response.status, message = errorDetail(payload) || `${provider} generation failed`, lower = message.toLowerCase();
+  const kind: AiErrorKind = status === 429 || lower.includes("quota") || lower.includes("rate limit") ? "rate_limit"
+    : status === 401 || status === 403 || lower.includes("api key") || lower.includes("permission") ? "auth"
+      : status === 404 || status === 503 || lower.includes("model") && lower.includes("unavailable") ? "unavailable" : "unknown";
+  return new AiProviderError(kind, message, { provider, status, retryAfterMs: retryDelayMs(payload, response.headers.get("retry-after")) });
+}
+
+function normalizeProviderError(provider: AiGenerationResult["provider"], error: unknown) {
+  if (error instanceof AiProviderError) return error;
+  if (error instanceof StructuredOutputError) return new AiProviderError("structured_output", error.message, { provider, cause: error });
+  if (error instanceof DOMException && error.name === "TimeoutError") return new AiProviderError("timeout", `${provider} timed out`, { provider, cause: error });
+  return new AiProviderError("unknown", error instanceof Error ? error.message : `${provider} generation failed`, { provider, cause: error });
+}
+
+const transientKinds = new Set<AiErrorKind>(["rate_limit", "unavailable", "timeout"]);
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 const SYSTEM_INSTRUCTION =
   "You are StudyOS, a rigorous source-grounded tutor. Use only the supplied user document and never invent facts. Every factual answer, summary item, flashcard, and question must cite the actual source filename plus the most precise available page, slide, heading, or section. Never fabricate page numbers or use placeholder citations. If an exact location is unavailable, cite the filename and nearest real heading/section. Reply in the learner's requested language, supporting English, Italian, and Persian, and defaulting to Italian. If the source does not answer the request, say so clearly.";
 
@@ -157,7 +201,7 @@ class GeminiProvider implements AiProvider {
 
   async generate(request: AiGenerationRequest): Promise<AiGenerationResult> {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
-    if (!apiKey) throw new Error("AI is not configured yet. Add GEMINI_API_KEY in Vercel.");
+    if (!apiKey) throw new AiProviderError("auth", "Gemini API key is not configured", { provider: this.name });
 
     const sourcePart = request.source.text !== undefined
       ? { text: `SOURCE FILE: ${request.source.name}\n\n${request.source.text}` }
@@ -185,7 +229,7 @@ class GeminiProvider implements AiProvider {
       },
     );
       const payload = await response.json() as Record<string, unknown>;
-      if (!response.ok) throw new Error(errorDetail(payload) || "Gemini generation failed");
+      if (!response.ok) throw providerError(this.name, response, payload);
 
       const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
       const candidate = candidates[0] && typeof candidates[0] === "object"
@@ -252,7 +296,7 @@ class OpenAiProvider implements AiProvider {
 
   async generate(request: AiGenerationRequest): Promise<AiGenerationResult> {
     const apiKey = process.env.OPENAI_API_KEY?.trim();
-    if (!apiKey) throw new Error("OpenAI is selected but OPENAI_API_KEY is not configured.");
+    if (!apiKey) throw new AiProviderError("auth", "OpenAI API key is not configured", { provider: this.name });
     const source = request.source.text !== undefined
       ? { type: "input_text", text: `SOURCE FILE: ${request.source.name}\n\n${request.source.text}` }
       : {
@@ -276,7 +320,7 @@ class OpenAiProvider implements AiProvider {
       signal: AbortSignal.timeout(55_000),
     });
     const payload = await response.json() as Record<string, unknown>;
-    if (!response.ok) throw new Error(errorDetail(payload) || "OpenAI generation failed");
+    if (!response.ok) throw providerError(this.name, response, payload);
     const usage = (payload.usage || {}) as { input_tokens?: number; output_tokens?: number };
     return {
       provider: this.name,
@@ -287,9 +331,58 @@ class OpenAiProvider implements AiProvider {
   }
 }
 
-export function configuredAiProvider(): AiProvider {
+function selectedProvider(): AiProvider {
   const provider = process.env.AI_PROVIDER?.trim().toLowerCase() || "gemini";
   if (provider === "gemini") return new GeminiProvider();
   if (provider === "openai") return new OpenAiProvider();
   throw new Error(`Unsupported AI_PROVIDER: ${provider}`);
 }
+
+function fallbackProvider(primary: AiProvider) {
+  if (primary.name === "gemini" && process.env.OPENAI_API_KEY?.trim()) return new OpenAiProvider();
+  if (primary.name === "openai" && process.env.GEMINI_API_KEY?.trim()) return new GeminiProvider();
+  return null;
+}
+
+class ResilientAiProvider implements AiProvider {
+  readonly name: AiProvider["name"];
+  readonly model: string;
+  private readonly primary: AiProvider;
+  constructor(primary: AiProvider) { this.primary = primary; this.name = primary.name; this.model = primary.model; }
+  async generate(request: AiGenerationRequest) {
+    const maxRetries = Math.max(0, Math.min(2, Number(process.env.AI_MAX_RETRIES ?? 1)));
+    let lastError: AiProviderError | undefined;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      try { return await this.primary.generate(request); }
+      catch (error) {
+        lastError = normalizeProviderError(this.primary.name, error);
+        console.warn("AI provider attempt failed", { provider: this.primary.name, model: this.primary.model, kind: lastError.kind, status: lastError.options.status, attempt: attempt + 1, retryAfterMs: lastError.options.retryAfterMs });
+        if (!transientKinds.has(lastError.kind) || attempt === maxRetries) break;
+        const base = lastError.options.retryAfterMs ?? Math.min(8_000, 1_000 * 2 ** attempt);
+        await sleep(base + (base > 0 ? Math.floor(Math.random() * Math.min(750, base * .1)) : 0));
+      }
+    }
+    const fallback = fallbackProvider(this.primary);
+    if (lastError && transientKinds.has(lastError.kind) && fallback) {
+      console.warn("AI provider fallback", { fromProvider: this.primary.name, fromModel: this.primary.model, toProvider: fallback.name, toModel: fallback.model, kind: lastError.kind });
+      try { return await fallback.generate(request); }
+      catch (error) { const fallbackError = normalizeProviderError(fallback.name, error); console.error("AI fallback failed", { provider: fallback.name, model: fallback.model, kind: fallbackError.kind, status: fallbackError.options.status }); throw fallbackError; }
+    }
+    throw lastError;
+  }
+}
+
+export function publicAiError(error: unknown, language = "en") {
+  const aiError = error instanceof AiProviderError ? error : normalizeProviderError("gemini", error), lang = language.toLowerCase().slice(0, 2);
+  const messages = {
+    rate_limit: lang === "fa" ? "هوش مصنوعی موقتاً مشغول است. پیشرفت درس شما محفوظ است." : lang === "it" ? "L’AI è temporaneamente occupata. I progressi della lezione sono al sicuro." : "AI is temporarily busy. Your lesson progress is safe.",
+    unavailable: lang === "fa" ? "سرویس هوش مصنوعی موقتاً در دسترس نیست. پیشرفت شما محفوظ است." : lang === "it" ? "Il servizio AI è temporaneamente non disponibile. I tuoi progressi sono al sicuro." : "The AI service is temporarily unavailable. Your progress is safe.",
+    auth: lang === "fa" ? "تنظیمات سرویس هوش مصنوعی نیاز به بررسی دارد." : lang === "it" ? "La configurazione del servizio AI richiede attenzione." : "The AI service configuration needs attention.",
+    timeout: lang === "fa" ? "پاسخ هوش مصنوعی بیش از حد طول کشید. پیشرفت شما محفوظ است." : lang === "it" ? "La risposta AI ha impiegato troppo tempo. I tuoi progressi sono al sicuro." : "The AI response took too long. Your progress is safe.",
+    structured_output: lang === "fa" ? "پاسخ درس کامل نبود. لطفاً دوباره تلاش کنید؛ پیشرفت شما محفوظ است." : lang === "it" ? "La risposta della lezione era incompleta. Riprova: i tuoi progressi sono al sicuro." : "The lesson response was incomplete. Please retry; your progress is safe.",
+    unknown: lang === "fa" ? "ساخت درس انجام نشد. پیشرفت شما محفوظ است؛ لطفاً دوباره تلاش کنید." : lang === "it" ? "Non è stato possibile creare la lezione. I tuoi progressi sono al sicuro; riprova." : "The lesson could not be created. Your progress is safe; please retry.",
+  } satisfies Record<AiErrorKind, string>;
+  return { message: messages[aiError.kind], code: aiError.kind, retryAfterSeconds: aiError.options.retryAfterMs === undefined ? undefined : Math.max(1, Math.ceil(aiError.options.retryAfterMs / 1000)) };
+}
+
+export function configuredAiProvider(): AiProvider { return new ResilientAiProvider(selectedProvider()); }

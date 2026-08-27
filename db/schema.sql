@@ -134,6 +134,10 @@ create table if not exists public.professor_lessons (
   mastery_score numeric(5,2), created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
   unique(user_id,document_id,section_id)
 );
+alter table public.professor_lessons add column if not exists provider text;
+alter table public.professor_lessons add column if not exists model text;
+alter table public.professor_lessons add column if not exists input_tokens int not null default 0;
+alter table public.professor_lessons add column if not exists output_tokens int not null default 0;
 create table if not exists public.weak_concepts (
   id uuid primary key default gen_random_uuid(), user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
   section_id uuid not null references public.document_sections(id) on delete cascade, concept text not null, evidence text,

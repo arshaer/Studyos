@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { configuredAiProvider, parseStructuredOutput, StructuredOutputError } from "../src/lib-ai.ts";
+import { AiProviderError, configuredAiProvider, parseStructuredOutput, publicAiError, retryDelayMs, StructuredOutputError } from "../src/lib-ai.ts";
 
 const tutorSchema = {
   type: "object",
@@ -133,4 +133,34 @@ test("Gemini Summary uses the same prompt-only JSON compatibility mode", async (
     delete process.env.GEMINI_API_KEY;
     delete process.env.AI_PROVIDER;
   }
+});
+
+test("parses Google RetryInfo and Retry-After delays", () => {
+  assert.equal(retryDelayMs({ error: { details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "23.8s" }] } }), 23_800);
+  assert.equal(retryDelayMs({}, "12"), 12_000);
+});
+
+test("retries one Gemini 429 and succeeds without exposing quota details", async () => {
+  process.env.AI_PROVIDER = "gemini"; process.env.GEMINI_API_KEY = "test-only"; process.env.AI_MAX_RETRIES = "1";
+  const originalFetch = globalThis.fetch; let calls = 0;
+  globalThis.fetch = (async () => { calls += 1; return calls === 1
+    ? new Response(JSON.stringify({ error: { code: 429, message: "Quota exceeded for generate_content_free_tier_requests", details: [{ retryDelay: "0s" }] } }), { status: 429 })
+    : new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ title: "Answer", content: "Safe", citations: [], followUps: [] }) }] } }] }), { status: 200 }); }) as typeof fetch;
+  try { const result = await configuredAiProvider().generate({ mode: "tutor", prompt: "help", schema: tutorSchema, source: { mimeType: "text/plain", name: "notes.pdf", text: "source" } }); assert.equal(result.result.content, "Safe"); assert.equal(calls, 2); }
+  finally { globalThis.fetch = originalFetch; delete process.env.GEMINI_API_KEY; delete process.env.AI_PROVIDER; delete process.env.AI_MAX_RETRIES; }
+});
+
+test("falls back to configured OpenAI after bounded Gemini rate limit", async () => {
+  process.env.AI_PROVIDER = "gemini"; process.env.GEMINI_API_KEY = "test-only"; process.env.OPENAI_API_KEY = "test-only"; process.env.AI_MAX_RETRIES = "0";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => String(input).includes("googleapis")
+    ? new Response(JSON.stringify({ error: { code: 429, message: "quota exhausted" } }), { status: 429 })
+    : new Response(JSON.stringify({ output_text: JSON.stringify({ title: "Fallback", content: "Available", citations: [], followUps: [] }), usage: { input_tokens: 7, output_tokens: 3 } }), { status: 200 })) as typeof fetch;
+  try { const result = await configuredAiProvider().generate({ mode: "tutor", prompt: "help", schema: tutorSchema, source: { mimeType: "text/plain", name: "notes.pdf", text: "source" } }); assert.equal(result.provider, "openai"); assert.equal(result.result.title, "Fallback"); assert.deepEqual(result.usage, { input_tokens: 7, output_tokens: 3 }); }
+  finally { globalThis.fetch = originalFetch; delete process.env.GEMINI_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.AI_PROVIDER; delete process.env.AI_MAX_RETRIES; }
+});
+
+test("sanitizes provider quota errors for the Professor UI", () => {
+  const safe = publicAiError(new AiProviderError("rate_limit", "Quota exceeded: generate_content_free_tier_requests https://ai.google.dev", { provider: "gemini", retryAfterMs: 23_800 }), "en");
+  assert.equal(safe.retryAfterSeconds, 24); assert.match(safe.message, /temporarily busy/); assert.doesNotMatch(safe.message, /quota|google|generate_content|https/i);
 });
