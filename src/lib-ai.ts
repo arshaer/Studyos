@@ -38,6 +38,18 @@ function taskFor(mode: AiMode, prompt: string) {
   return `Answer this learner's question and teach the concept step by step: ${prompt}`;
 }
 
+function strictJsonInstruction(schema: Record<string, unknown>, citations: string[]) {
+  const citationRule = citations.length
+    ? `Every citation must exactly match one of these allowed SOURCE labels: ${JSON.stringify(citations)}.`
+    : "Use an empty citation list when the supplied source does not contain a verifiable location.";
+  return [
+    "Return only one complete JSON object, without markdown fences or commentary.",
+    `The JSON must conform exactly to this schema: ${JSON.stringify(schema)}.`,
+    citationRule,
+    "Do not invent, repair, approximate, or translate SOURCE labels.",
+  ].join("\n");
+}
+
 export class StructuredOutputError extends Error {
   constructor(message: string) {
     super(message);
@@ -142,11 +154,9 @@ class GeminiProvider implements AiProvider {
         headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-          contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
+          contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}\n\n${strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
           generationConfig: {
             maxOutputTokens: request.mode === "summary" ? 8192 : 4096,
-            responseMimeType: "application/json",
-            responseJsonSchema: effectiveSchema,
           },
         }),
         signal: AbortSignal.timeout(55_000),

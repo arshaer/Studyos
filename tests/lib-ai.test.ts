@@ -36,7 +36,7 @@ test("rejects a multiple-choice answer not present in options", () => {
   assert.throws(() => parseStructuredOutput(JSON.stringify({ items: [{ options: ["A", "B"], answer: "C" }] }), schema), StructuredOutputError);
 });
 
-test("Gemini generateContent sends native MIME/schema fields and repairs once", async () => {
+test("Gemini Tutor uses prompt-only JSON compatibility mode and repairs once", async () => {
   process.env.AI_PROVIDER = "gemini";
   process.env.GEMINI_API_KEY = "test-only";
   const originalFetch = globalThis.fetch;
@@ -60,15 +60,43 @@ test("Gemini generateContent sends native MIME/schema fields and repairs once", 
     assert.deepEqual(result.usage, { input_tokens: 20, output_tokens: 10 });
     assert.equal(bodies.length, 2);
     const config = bodies[0].generationConfig as Record<string, unknown>;
-    assert.equal(config.responseMimeType, "application/json");
-    assert.deepEqual(config.responseJsonSchema, {
-      ...tutorSchema,
-      properties: {
-        ...tutorSchema.properties,
-        citations: { type: "array", items: { type: "string", enum: ["notes.pdf · page 2"] } },
-      },
-    });
+    assert.deepEqual(config, { maxOutputTokens: 4096 });
     assert.equal(config.responseFormat, undefined);
+    const prompt = ((bodies[0].contents as Array<{ parts: Array<{ text?: string }> }>)[0].parts[1].text || "");
+    assert.match(prompt, /Return only one complete JSON object/);
+    assert.match(prompt, /notes\.pdf · page 2/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.AI_PROVIDER;
+  }
+});
+
+test("Gemini Summary uses the same prompt-only JSON compatibility mode", async () => {
+  process.env.AI_PROVIDER = "gemini";
+  process.env.GEMINI_API_KEY = "test-only";
+  const originalFetch = globalThis.fetch;
+  let body: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({
+      candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ title: "Sintesi", content: "Contenuto", citations: ["notes.pdf · page 2"], followUps: [] }) }] } }],
+      usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 6 },
+    }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await configuredAiProvider().generate({
+      mode: "summary",
+      prompt: "Detailed depth",
+      schema: tutorSchema,
+      allowedCitations: ["notes.pdf · page 2"],
+      source: { mimeType: "text/plain", name: "notes.pdf", text: "[SOURCE: notes.pdf · page 2]\nIndice analitico" },
+    });
+    assert.equal(result.result.title, "Sintesi");
+    assert.deepEqual(body?.generationConfig, { maxOutputTokens: 8192 });
+    assert.equal(JSON.stringify(body).includes("responseMimeType"), false);
+    assert.equal(JSON.stringify(body).includes("responseJsonSchema"), false);
+    assert.equal(JSON.stringify(body).includes("responseFormat"), false);
   } finally {
     globalThis.fetch = originalFetch;
     delete process.env.GEMINI_API_KEY;
