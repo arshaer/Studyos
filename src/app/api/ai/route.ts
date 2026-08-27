@@ -13,9 +13,13 @@ const MAP_GROUP_CHARACTERS = 90_000;
 const modes = new Set(["tutor", "summary", "flashcards", "questions"]);
 
 function schemaFor(mode: AiMode) {
-  if (mode === "flashcards") return { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "object", properties: { front: { type: "string" }, back: { type: "string" }, citation: { type: "string" } }, required: ["front", "back", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
-  if (mode === "questions") return { type: "object", properties: { title: { type: "string" }, items: { type: "array", items: { type: "object", properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" } }, answer: { type: "string" }, explanation: { type: "string" }, citation: { type: "string" } }, required: ["question", "options", "answer", "explanation", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
-  return { type: "object", properties: { title: { type: "string" }, content: { type: "string" }, citations: { type: "array", items: { type: "string" } }, followUps: { type: "array", items: { type: "string" } } }, required: ["title", "content", "citations", "followUps"], additionalProperties: false };
+  if (mode === "flashcards") return { type: "object", properties: { title: { type: "string", description: "Short deck title in the learner's language" }, items: { type: "array", minItems: 10, maxItems: 10, items: { type: "object", properties: { front: { type: "string" }, back: { type: "string" }, citation: { type: "string", description: "One exact SOURCE label supplied in the context" } }, required: ["front", "back", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
+  if (mode === "questions") return { type: "object", properties: { title: { type: "string" }, items: { type: "array", minItems: 8, maxItems: 8, items: { type: "object", properties: { question: { type: "string" }, options: { type: "array", minItems: 4, maxItems: 4, items: { type: "string" } }, answer: { type: "string", description: "Must exactly equal one of the four options" }, explanation: { type: "string" }, citation: { type: "string", description: "One exact SOURCE label supplied in the context" } }, required: ["question", "options", "answer", "explanation", "citation"], additionalProperties: false } } }, required: ["title", "items"], additionalProperties: false };
+  return { type: "object", properties: { title: { type: "string" }, content: { type: "string", description: "Grounded answer or summary in the learner's language" }, citations: { type: "array", description: "Exact SOURCE labels supporting the answer; empty only when the source does not answer the request", items: { type: "string" } }, followUps: { type: "array", items: { type: "string" } } }, required: ["title", "content", "citations", "followUps"], additionalProperties: false };
+}
+
+function citationLabels(name: string, chunks: StoredChunk[]) {
+  return [...new Set(chunks.map((chunk) => citationLabel(name, chunk)))];
 }
 
 function chunkContext(name: string, chunks: StoredChunk[]) {
@@ -47,7 +51,7 @@ async function hierarchicalSummary(name: string, chunks: StoredChunk[], prompt: 
   while (level.length > 1) {
     const next: string[] = [];
     for (let offset = 0; offset < level.length; offset += 3) {
-      const result = await provider.generate({ mode: "summary", prompt: `Map step ${round + 1}: summarize every supplied part without dropping major concepts. Preserve all source labels exactly. ${prompt}`, schema: schemaFor("summary"), source: { mimeType: "text/plain", name, text: level.slice(offset, offset + 3).join("\n\n=== PART ===\n\n") } });
+      const result = await provider.generate({ mode: "summary", prompt: `Map step ${round + 1}: summarize every supplied part without dropping major concepts. Preserve all source labels exactly. ${prompt}`, schema: schemaFor("summary"), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: level.slice(offset, offset + 3).join("\n\n=== PART ===\n\n") } });
       addUsage(usage, result.usage);
       const value = result.result as { title?: string; content?: string; citations?: string[] };
       next.push(`${value.title || "Partial summary"}\n${value.content || ""}\nSources: ${(value.citations || []).join("; ")}`);
@@ -55,7 +59,7 @@ async function hierarchicalSummary(name: string, chunks: StoredChunk[], prompt: 
     level = next;
     round += 1;
   }
-  const final = await provider.generate({ mode: "summary", prompt: `Reduce step: synthesize one complete, structured entire-document summary. Preserve real citations from the supplied mapped summary. ${prompt}`, schema: schemaFor("summary"), source: { mimeType: "text/plain", name, text: level[0] } });
+  const final = await provider.generate({ mode: "summary", prompt: `Reduce step: synthesize one complete, structured entire-document summary. Preserve real citations from the supplied mapped summary. ${prompt}`, schema: schemaFor("summary"), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: level[0] } });
   addUsage(usage, final.usage);
   return { ...final, usage };
 }
@@ -101,7 +105,7 @@ export async function POST(request: Request) {
     const name = String(document.original_name);
     const generation = mode === "summary"
       ? await hierarchicalSummary(name, chunks, prompt)
-      : await configuredAiProvider().generate({ mode, prompt, schema: schemaFor(mode), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
+      : await configuredAiProvider().generate({ mode, prompt, schema: schemaFor(mode), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
     await sql`insert into public.ai_generations (user_id, document_id, mode, provider, model, prompt, response_json, input_tokens, output_tokens) values (${userId}, ${documentId}, ${mode}, ${generation.provider}, ${generation.model}, ${prompt}, ${JSON.stringify(generation.result)}::jsonb, ${generation.usage.input_tokens}, ${generation.usage.output_tokens})`;
     await sql`update public.documents set ai_status='completed', ai_error=null, updated_at=now() where id=${documentId} and user_id=${userId}`;
     return NextResponse.json({ result: generation.result, usage: generation.usage, remainingToday: DAILY_LIMIT - usedToday - 1 });

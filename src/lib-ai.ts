@@ -8,6 +8,7 @@ export type AiSource = {
 };
 
 export type AiGenerationRequest = {
+  allowedCitations?: string[];
   mode: AiMode;
   prompt: string;
   schema: Record<string, unknown>;
@@ -37,12 +38,76 @@ function taskFor(mode: AiMode, prompt: string) {
   return `Answer this learner's question and teach the concept step by step: ${prompt}`;
 }
 
-function parseJson(text: string) {
-  try {
-    return JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    throw new Error("The AI response was not valid structured output");
+export class StructuredOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StructuredOutputError";
   }
+}
+
+function jsonCandidate(text: string) {
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
+}
+
+function validateSchema(value: unknown, schema: Record<string, unknown>, path = "result"): string[] {
+  const issues: string[] = [];
+  const type = schema.type;
+  if (type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [`${path} must be an object`];
+    const record = value as Record<string, unknown>;
+    const properties = (schema.properties || {}) as Record<string, Record<string, unknown>>;
+    for (const key of (schema.required || []) as string[]) if (!(key in record)) issues.push(`${path}.${key} is required`);
+    if (schema.additionalProperties === false) for (const key of Object.keys(record)) if (!(key in properties)) issues.push(`${path}.${key} is not allowed`);
+    for (const [key, childSchema] of Object.entries(properties)) if (key in record) issues.push(...validateSchema(record[key], childSchema, `${path}.${key}`));
+  } else if (type === "array") {
+    if (!Array.isArray(value)) return [`${path} must be an array`];
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) issues.push(`${path} needs at least ${schema.minItems} items`);
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) issues.push(`${path} allows at most ${schema.maxItems} items`);
+    const itemSchema = schema.items as Record<string, unknown> | undefined;
+    if (itemSchema) value.forEach((item, index) => issues.push(...validateSchema(item, itemSchema, `${path}[${index}]`)));
+  } else if (type === "string") {
+    if (typeof value !== "string" || !value.trim()) issues.push(`${path} must be a non-empty string`);
+    else if (Array.isArray(schema.enum) && !(schema.enum as unknown[]).includes(value)) issues.push(`${path} is not an allowed value`);
+  }
+  return issues;
+}
+
+export function parseStructuredOutput(text: string, schema: Record<string, unknown>) {
+  let parsed: unknown;
+  try { parsed = JSON.parse(jsonCandidate(text)); }
+  catch { throw new StructuredOutputError("Gemini returned malformed JSON"); }
+  const issues = validateSchema(parsed, schema);
+  if (parsed && typeof parsed === "object" && Array.isArray((parsed as { items?: unknown }).items)) {
+    for (const [index, item] of ((parsed as { items: unknown[] }).items).entries()) {
+      if (item && typeof item === "object") {
+        const question = item as { answer?: unknown; options?: unknown };
+        if (typeof question.answer === "string" && Array.isArray(question.options) && !question.options.includes(question.answer)) {
+          issues.push(`result.items[${index}].answer must exactly match an option`);
+        }
+      }
+    }
+  }
+  if (issues.length) throw new StructuredOutputError(`Gemini JSON failed validation: ${issues.slice(0, 4).join("; ")}`);
+  return parsed as Record<string, unknown>;
+}
+
+function citationConstrainedSchema(schema: Record<string, unknown>, citations: string[]) {
+  if (!citations.length) return schema;
+  const copy = structuredClone(schema);
+  const visit = (node: Record<string, unknown>, key?: string) => {
+    if (key === "citation" && node.type === "string") node.enum = citations;
+    if (key === "citations" && node.type === "array" && node.items && typeof node.items === "object") {
+      (node.items as Record<string, unknown>).enum = citations;
+    }
+    const properties = node.properties as Record<string, Record<string, unknown>> | undefined;
+    if (properties) for (const [childKey, child] of Object.entries(properties)) visit(child, childKey);
+    if (node.items && typeof node.items === "object") visit(node.items as Record<string, unknown>);
+  };
+  visit(copy);
+  return copy;
 }
 
 function errorDetail(payload: Record<string, unknown>) {
@@ -68,38 +133,56 @@ class GeminiProvider implements AiProvider {
             data: Buffer.from(request.source.bytes || []).toString("base64"),
           },
         };
-    const response = await fetch(
+    const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
+    const call = async (repair?: string) => {
+      const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:generateContent`,
       {
         method: "POST",
         headers: { "x-goog-api-key": apiKey, "content-type": "application/json" },
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-          contents: [{ role: "user", parts: [sourcePart, { text: taskFor(request.mode, request.prompt) }] }],
+          contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
           generationConfig: {
-            maxOutputTokens: request.mode === "summary" ? 2200 : 1400,
-            responseMimeType: "application/json",
-            responseJsonSchema: request.schema,
+            maxOutputTokens: request.mode === "summary" ? 8192 : 4096,
+            responseFormat: { text: { mimeType: "application/json", schema: effectiveSchema } },
           },
         }),
         signal: AbortSignal.timeout(55_000),
       },
     );
-    const payload = await response.json() as Record<string, unknown>;
-    if (!response.ok) throw new Error(errorDetail(payload) || "Gemini generation failed");
+      const payload = await response.json() as Record<string, unknown>;
+      if (!response.ok) throw new Error(errorDetail(payload) || "Gemini generation failed");
 
-    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
-    const content = candidates[0] && typeof candidates[0] === "object"
-      ? (candidates[0] as { content?: { parts?: Array<{ text?: string }> } }).content
-      : undefined;
-    const text = content?.parts?.find((part) => typeof part.text === "string")?.text;
-    if (!text) throw new Error("The Gemini response did not contain usable output");
-    const usage = (payload.usageMetadata || {}) as { promptTokenCount?: number; candidatesTokenCount?: number };
+      const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+      const candidate = candidates[0] && typeof candidates[0] === "object"
+        ? candidates[0] as { content?: { parts?: Array<{ text?: string }> }; finishReason?: string }
+        : undefined;
+      const text = candidate?.content?.parts?.filter((part) => typeof part.text === "string").map((part) => part.text).join("") || "";
+      const usage = (payload.usageMetadata || {}) as { promptTokenCount?: number; candidatesTokenCount?: number };
+      if (!text) throw new StructuredOutputError(`Gemini returned no JSON (finish reason: ${candidate?.finishReason || "unknown"})`);
+      return { text, finishReason: candidate?.finishReason || "unknown", usage: { input_tokens: usage.promptTokenCount || 0, output_tokens: usage.candidatesTokenCount || 0 } };
+    };
+
+    const first = await call();
+    let parsed: Record<string, unknown>;
+    let totalUsage = first.usage;
+    try { parsed = parseStructuredOutput(first.text, effectiveSchema); }
+    catch (error) {
+      if (!(error instanceof StructuredOutputError)) throw error;
+      const retry = await call(`${error.message}. Return a fresh, complete JSON value matching the supplied response schema. Use only SOURCE labels present in the document; do not invent citations.`);
+      totalUsage = { input_tokens: first.usage.input_tokens + retry.usage.input_tokens, output_tokens: first.usage.output_tokens + retry.usage.output_tokens };
+      try { parsed = parseStructuredOutput(retry.text, effectiveSchema); }
+      catch (retryError) {
+        const detail = retryError instanceof Error ? retryError.message : "unknown validation error";
+        throw new StructuredOutputError(`Gemini structured output could not be recovered after one retry (${detail}; finish reason: ${retry.finishReason})`);
+      }
+    }
     return {
       provider: this.name,
       model: this.model,
-      result: parseJson(text),
-      usage: { input_tokens: usage.promptTokenCount || 0, output_tokens: usage.candidatesTokenCount || 0 },
+      result: parsed,
+      usage: totalUsage,
     };
   }
 }
@@ -133,6 +216,7 @@ class OpenAiProvider implements AiProvider {
           file_data: `data:${request.source.mimeType};base64,${Buffer.from(request.source.bytes || []).toString("base64")}`,
           detail: "auto",
         };
+    const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
@@ -142,7 +226,7 @@ class OpenAiProvider implements AiProvider {
         max_output_tokens: request.mode === "summary" ? 2200 : 1400,
         instructions: SYSTEM_INSTRUCTION,
         input: [{ role: "user", content: [source, { type: "input_text", text: taskFor(request.mode, request.prompt) }] }],
-        text: { format: { type: "json_schema", name: `studyos_${request.mode}`, strict: true, schema: request.schema } },
+        text: { format: { type: "json_schema", name: `studyos_${request.mode}`, strict: true, schema: effectiveSchema } },
       }),
       signal: AbortSignal.timeout(55_000),
     });
@@ -152,7 +236,7 @@ class OpenAiProvider implements AiProvider {
     return {
       provider: this.name,
       model: this.model,
-      result: parseJson(openAiOutputText(payload)),
+      result: parseStructuredOutput(openAiOutputText(payload), effectiveSchema),
       usage: { input_tokens: usage.input_tokens || 0, output_tokens: usage.output_tokens || 0 },
     };
   }
