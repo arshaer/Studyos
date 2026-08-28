@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AiProviderError, configuredAiProvider, parseStructuredOutput, publicAiError, retryDelayMs, StructuredOutputError } from "../src/lib-ai.ts";
+import { AiProviderError, compressionPolicyFor, configuredAiProvider, createAIGateway, parseStructuredOutput, publicAiError, resetProviderHealthForTests, retryDelayMs, streamAI, StructuredOutputError, type AiProvider } from "../src/lib-ai.ts";
 
 const tutorSchema = {
   type: "object",
@@ -163,4 +163,72 @@ test("falls back to configured OpenAI after bounded Gemini rate limit", async ()
 test("sanitizes provider quota errors for the Professor UI", () => {
   const safe = publicAiError(new AiProviderError("rate_limit", "Quota exceeded: generate_content_free_tier_requests https://ai.google.dev", { provider: "gemini", retryAfterMs: 23_800 }), "en");
   assert.equal(safe.retryAfterSeconds, 24); assert.match(safe.message, /temporarily busy/); assert.doesNotMatch(safe.message, /quota|google|generate_content|https/i);
+});
+
+const gatewayRequest = { task: "tutor" as const, mode: "tutor" as const, prompt: "Explain", schema: tutorSchema, protectedContext: true, source: { mimeType: "text/plain", name: "notes.pdf", text: "Na+ concentration is 140 mmol/L" } };
+const success = (provider: "omniroute" | "gemini" | "openai", title = provider) => ({ provider, model: `${provider}-model`, result: { title, content: "Grounded", citations: [], followUps: [] }, usage: { input_tokens: 10, output_tokens: 4 } });
+const mockProvider = (name: AiProvider["name"], generate: AiProvider["generate"]): AiProvider => ({ name, model: `${name}-model`, generate });
+
+test("gateway returns a successful primary route", async () => {
+  resetProviderHealthForTests();
+  const result = await createAIGateway({ providers: [mockProvider("omniroute", async () => success("omniroute"))] })(gatewayRequest);
+  assert.equal(result.provider, "omniroute"); assert.equal(result.fallbackCount, 0); assert.equal(result.gateway, "studyos");
+});
+
+test("gateway falls back after rate limit", async () => {
+  resetProviderHealthForTests();
+  const primary = mockProvider("omniroute", async () => { throw new AiProviderError("rate_limit", "busy", { provider: "omniroute", retryAfterMs: 0 }); });
+  const result = await createAIGateway({ providers: [primary, mockProvider("gemini", async () => success("gemini"))] })({ ...gatewayRequest });
+  assert.equal(result.provider, "gemini"); assert.equal(result.fallbackCount, 1);
+});
+
+test("gateway falls back after timeout and when OmniRoute is unavailable", async () => {
+  for (const kind of ["timeout", "unavailable"] as const) {
+    resetProviderHealthForTests();
+    const primary = mockProvider("omniroute", async () => { throw new AiProviderError(kind, kind, { provider: "omniroute" }); });
+    const result = await createAIGateway({ providers: [primary, mockProvider("openai", async () => success("openai"))] })({ ...gatewayRequest });
+    assert.equal(result.provider, "openai");
+  }
+});
+
+test("gateway reports all providers unavailable", async () => {
+  resetProviderHealthForTests();
+  const down = (name: AiProvider["name"]) => mockProvider(name, async () => { throw new AiProviderError("unavailable", "down", { provider: name }); });
+  await assert.rejects(createAIGateway({ providers: [down("omniroute"), down("gemini")] })({ ...gatewayRequest }), (error: unknown) => error instanceof AiProviderError && error.kind === "unavailable");
+});
+
+test("invalid structured output is bounded then falls back", async () => {
+  resetProviderHealthForTests(); let attempts = 0;
+  const invalid = mockProvider("omniroute", async () => { attempts += 1; throw new StructuredOutputError("invalid JSON"); });
+  const result = await createAIGateway({ providers: [invalid, mockProvider("gemini", async () => success("gemini"))] })({ ...gatewayRequest });
+  assert.equal(result.provider, "gemini"); assert.equal(attempts, 2);
+});
+
+test("compression policy protects scientific source context", () => {
+  assert.equal(compressionPolicyFor(gatewayRequest), "off");
+  assert.equal(compressionPolicyFor({ ...gatewayRequest, protectedContext: false }), "lite");
+  assert.equal(compressionPolicyFor({ ...gatewayRequest, task: "simple_generation", protectedContext: false }), "standard");
+  assert.equal(gatewayRequest.source.text, "Na+ concentration is 140 mmol/L");
+});
+
+test("telemetry persists without prompt content and failures do not break generation", async () => {
+  resetProviderHealthForTests(); const rows: unknown[] = [];
+  const result = await createAIGateway({ providers: [mockProvider("gemini", async () => success("gemini"))], persistTelemetry: async row => { rows.push(row); } })({ ...gatewayRequest, userId: "user-1", documentId: "doc-1" });
+  assert.equal(result.provider, "gemini"); assert.equal(rows.length, 1); assert.equal("prompt" in (rows[0] as object), false);
+  const stillWorks = await createAIGateway({ providers: [mockProvider("openai", async () => success("openai"))], persistTelemetry: async () => { throw new Error("db down"); } })({ ...gatewayRequest });
+  assert.equal(stillWorks.provider, "openai");
+});
+
+test("streaming emits one validated provider response and never mixes fallbacks", async () => {
+  resetProviderHealthForTests();
+  const streamed = await streamAI(gatewayRequest, { providers: [mockProvider("gemini", async () => success("gemini", "Validated"))] });
+  const text = await new Response(streamed.stream).text();
+  assert.equal(JSON.parse(text).title, "Validated");
+});
+
+test("missing optional OmniRoute configuration does not block a direct provider", async () => {
+  resetProviderHealthForTests();
+  const result = await createAIGateway({ providers: [mockProvider("gemini", async () => success("gemini"))] })(gatewayRequest);
+  assert.equal(result.provider, "gemini");
+  await assert.rejects(createAIGateway({ providers: [] })(gatewayRequest), /No AI provider is configured/);
 });

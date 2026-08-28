@@ -35,6 +35,16 @@ Next.js study workspace with Neon Auth, private Vercel Blob storage, Neon/Postgr
 
 Gemini is the default and does not require `OPENAI_API_KEY`. Optional OpenAI support remains available by setting `AI_PROVIDER=openai`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL`.
 
+## StudyOS AI Gateway
+
+All application generation flows pass through the provider-independent StudyOS gateway:
+
+`StudyOS -> StudyOS AI Gateway -> {OmniRoute, Gemini Direct, OpenAI Direct}`
+
+OmniRoute is optional. Configure `OMNIROUTE_BASE_URL` (including `/v1`) and `OMNIROUTE_API_KEY` to use its documented OpenAI-compatible Chat Completions endpoint. StudyOS uses documented `auto/fast`, `auto`, and `auto/smart` aliases by task quality and explicitly disables OmniRoute compression whenever original indexed evidence is included. Direct Gemini/OpenAI routes remain available if OmniRoute is absent or unhealthy.
+
+Stable summaries, flashcards, and questions are reused only when the document index version, scope, prompt/options, and gateway policy version match. Tutor and Professor answers are never cached. Request telemetry stores routing and usage metadata in `ai_requests`; prompts and source chunks are not copied into that table.
+
 Existing databases are migrated automatically on the first request. Document processing/AI state columns and `ai_generations.provider` are added when missing; new generations record the provider and model actually used.
 
 The Library accepts files up to 250 MB through direct browser-to-Blob upload. Processing extracts PDF/TXT/DOCX/PPTX content into `document_chunks`; AI actions read those chunks, so there is no separate 20 MB or 50 MB AI-source limit.

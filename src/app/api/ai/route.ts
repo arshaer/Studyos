@@ -3,6 +3,7 @@ import { configuredAiProvider, type AiMode, type AiGenerationResult } from "@/li
 import { citationLabel, type StoredChunk } from "@/lib-document-processing";
 import { db, ensureStudySchema } from "@/lib-db";
 import { currentUserId } from "@/lib-user";
+import { createHash } from "node:crypto";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -45,8 +46,8 @@ function groupChunks(name: string, chunks: StoredChunk[]) {
   return groups;
 }
 
-async function hierarchicalSummary(name: string, chunks: StoredChunk[], prompt: string) {
-  const provider = configuredAiProvider();
+async function hierarchicalSummary(name: string, chunks: StoredChunk[], prompt: string, userId: string, documentId: string) {
+  const provider = configuredAiProvider("summary", { userId, documentId, protectedContext: true });
   const usage = { input_tokens: 0, output_tokens: 0 };
   let level = groupChunks(name, chunks);
   let round = 0;
@@ -92,7 +93,7 @@ export async function POST(request: Request) {
     const usageRows = await sql`select count(*)::int as count from public.ai_generations where user_id=${userId} and created_at >= current_date`;
     const usedToday = Number(usageRows[0]?.count || 0);
     if (usedToday >= DAILY_LIMIT) return NextResponse.json({ error: "Daily AI limit reached. Try again tomorrow." }, { status: 429 });
-    const documents = await sql`select id, title, original_name, processing_status from public.documents where id=${documentId} and user_id=${userId} limit 1`;
+    const documents = await sql`select id, title, original_name, processing_status, index_version from public.documents where id=${documentId} and user_id=${userId} limit 1`;
     const document = documents[0];
     if (!document) return NextResponse.json({ error: "Document not found" }, { status: 404 });
     if (document.processing_status !== "ready") return NextResponse.json({ error: "This document is still processing and is not ready for AI yet" }, { status: 409 });
@@ -128,14 +129,22 @@ export async function POST(request: Request) {
     const chunks = chunkRows as unknown as StoredChunk[];
     if (!chunks.length) throw new Error("The document contains no readable text.");
     const name = String(document.original_name);
+    const cacheable = mode === "summary" || mode === "flashcards" || mode === "questions";
+    const policyVersion = "studyos-ai-v1";
+    const cacheKey = cacheable ? createHash("sha256").update(JSON.stringify({ documentId, sourceVersion: Number(document.index_version), mode, scopeKey, prompt, language, detailLevel, policyVersion })).digest("hex") : null;
+    if (cacheKey) {
+      const cached = await sql`select id,response_json,input_tokens,output_tokens,provider,model from public.ai_generations where user_id=${userId} and cache_key=${cacheKey} and status='completed' order by created_at desc limit 1`;
+      if (cached[0]) return NextResponse.json({ result: cached[0].response_json, usage: { input_tokens: cached[0].input_tokens, output_tokens: cached[0].output_tokens }, remainingToday: DAILY_LIMIT - usedToday, generationId: cached[0].id, cached: true });
+    }
     let effectivePrompt=prompt;
     if(mode==="tutor"&&conversationId){const history=await sql`select role,content_json from public.ai_messages where conversation_id=${conversationId} and user_id=${userId} order by created_at desc limit 12`;effectivePrompt=`Answer the newest question in the same language it was asked. Preserve conversation continuity.\n\nConversation (oldest to newest):\n${history.reverse().map(row=>`${row.role}: ${JSON.stringify(row.content_json)}`).join("\n")}\n\nNewest question: ${prompt}`}
-    const provider=configuredAiProvider();
+    const task = mode === "questions" ? "quiz" : mode;
+    const provider=configuredAiProvider(task, { userId, documentId, protectedContext: true });
     const versionRows=mode==="summary"?await sql`select coalesce(max(version),0)::int+1 as version from public.ai_generations where user_id=${userId} and document_id=${documentId} and mode='summary' and scope_key=${scopeKey}`:[{version:1}];
-    const pending=await sql`insert into public.ai_generations(user_id,document_id,mode,provider,model,prompt,response_json,input_tokens,output_tokens,scope_json,scope_key,version,language,detail_level,status,conversation_id)values(${userId},${documentId},${mode},${provider.name},${provider.model},${prompt},'{}'::jsonb,0,0,${JSON.stringify(scope)}::jsonb,${scopeKey},${versionRows[0].version},${language},${detailLevel},'generating',${conversationId||null})returning id`;
+    const pending=await sql`insert into public.ai_generations(user_id,document_id,mode,provider,model,prompt,response_json,input_tokens,output_tokens,scope_json,scope_key,version,language,detail_level,status,conversation_id,cache_key,source_version,policy_version)values(${userId},${documentId},${mode},${provider.name},${provider.model},${prompt},'{}'::jsonb,0,0,${JSON.stringify(scope)}::jsonb,${scopeKey},${versionRows[0].version},${language},${detailLevel},'generating',${conversationId||null},${cacheKey},${Number(document.index_version)},${policyVersion})returning id`;
     generationId=String(pending[0].id);
     const generation = mode === "summary"
-      ? await hierarchicalSummary(name, chunks, prompt)
+      ? await hierarchicalSummary(name, chunks, prompt, userId, documentId)
       : await provider.generate({ mode, prompt:effectivePrompt, schema: schemaFor(mode), allowedCitations: citationLabels(name, chunks), source: { mimeType: "text/plain", name, text: chunkContext(name, chunks) } });
     await sql`update public.ai_generations set provider=${generation.provider},model=${generation.model},response_json=${JSON.stringify(generation.result)}::jsonb,input_tokens=${generation.usage.input_tokens},output_tokens=${generation.usage.output_tokens},status='completed',completed_at=now(),updated_at=now() where id=${generationId} and user_id=${userId}`;
     if(mode==="tutor"&&conversationId){const citations=Array.isArray(generation.result.citations)?generation.result.citations:[];await sql`insert into public.ai_messages(conversation_id,user_id,role,content_json,citations_json,provider,model,input_tokens,output_tokens,status)values(${conversationId},${userId},'assistant',${JSON.stringify(generation.result)}::jsonb,${JSON.stringify(citations)}::jsonb,${generation.provider},${generation.model},${generation.usage.input_tokens},${generation.usage.output_tokens},'completed')`;await sql`update public.ai_conversations set provider=${generation.provider},model=${generation.model},updated_at=now() where id=${conversationId} and user_id=${userId}`}
@@ -143,13 +152,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ result: generation.result, usage: generation.usage, remainingToday: DAILY_LIMIT - usedToday - 1,conversationId,generationId });
   } catch (error) {
     console.error("AI generation", error);
-    const message = error instanceof Error ? error.message : "AI generation failed";
+    const { publicAiError } = await import("@/lib-ai");
+    const safe = publicAiError(error, "en");
+    const message = safe.message;
     if(userId&&generationId){try{const sql=db();await sql`update public.ai_generations set status='error',response_json=${JSON.stringify({error:message})}::jsonb,updated_at=now() where id=${generationId} and user_id=${userId}`}catch{}}
     if (userId && documentId) {
       try { const sql = db(); await sql`update public.documents set ai_status='error', ai_error=${message}, updated_at=now() where id=${documentId} and user_id=${userId}`; }
       catch (statusError) { console.error("AI status update", statusError); }
     }
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: message, code: safe.code, retryAfterSeconds: safe.retryAfterSeconds }, { status: ["rate_limit","unavailable","timeout"].includes(safe.code) ? 503 : 500 });
   }
 }
 
