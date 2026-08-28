@@ -384,8 +384,7 @@ class OmniRouteProvider implements AiProvider {
   readonly model: string;
   private readonly compression: CompressionPolicy;
   constructor(quality: AIQuality = "balanced", compression: CompressionPolicy = "off") {
-    this.model = process.env[`OMNIROUTE_MODEL_${quality.toUpperCase()}`]?.trim()
-      || (quality === "fast" ? "auto/fast" : quality === "high" ? "auto/smart" : "auto");
+    this.model = quality === "fast" ? "auto/fast" : quality === "high" ? "auto/smart" : "auto";
     this.compression = compression;
   }
   async generate(request: AiGenerationRequest): Promise<AiGenerationResult> {
