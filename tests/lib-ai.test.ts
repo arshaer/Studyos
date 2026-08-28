@@ -242,3 +242,30 @@ test("missing optional OmniRoute configuration does not block a direct provider"
   assert.equal(result.provider, "gemini");
   await assert.rejects(createAIGateway({ providers: [] })(gatewayRequest), /No AI provider is configured/);
 });
+
+test("OmniRoute requests a complete non-streaming response", async () => {
+  resetProviderHealthForTests();
+  process.env.OMNIROUTE_BASE_URL = "https://omniroute.example/v1";
+  process.env.OMNIROUTE_API_KEY = "test-only";
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({
+      model: "gemini/gemini-3.6-flash",
+      choices: [{ message: { content: JSON.stringify({ title: "Answer", content: "Grounded", citations: [], followUps: [] }) } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const result = await configuredAiProvider("tutor").generate(gatewayRequest);
+    assert.equal(result.provider, "omniroute");
+    assert.equal(requestBody?.stream, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OMNIROUTE_BASE_URL;
+    delete process.env.OMNIROUTE_API_KEY;
+  }
+});

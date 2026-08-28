@@ -402,6 +402,9 @@ class OmniRouteProvider implements AiProvider {
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "x-omniroute-compression": this.compression },
       body: JSON.stringify({
         model: this.model,
+        // StudyOS validates the complete structured result before returning it.
+        // Explicitly disable SSE while OmniRoute cascades across routes.
+        stream: false,
         messages: [
           { role: "system", content: SYSTEM_INSTRUCTION },
           { role: "user", content: `SOURCE FILE: ${request.source.name}\n\n${sourceText}\n\n${taskFor(request.mode, request.prompt)}\n\n${strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}` },
