@@ -108,6 +108,10 @@ function normalizeProviderError(provider: AiGenerationResult["provider"], error:
   if (error instanceof AiProviderError) return error;
   if (error instanceof StructuredOutputError) return new AiProviderError("structured_output", error.message, { provider, cause: error });
   if (error instanceof DOMException && error.name === "TimeoutError") return new AiProviderError("timeout", `${provider} timed out`, { provider, cause: error });
+  // Node's fetch rejects transport failures (DNS, refused connections, TLS, socket
+  // resets) with TypeError. These are route-availability failures and must advance
+  // the gateway to the next configured provider instead of terminating as unknown.
+  if (error instanceof TypeError) return new AiProviderError("unavailable", `${provider} is unavailable`, { provider, cause: error });
   return new AiProviderError("unknown", error instanceof Error ? error.message : `${provider} generation failed`, { provider, cause: error });
 }
 

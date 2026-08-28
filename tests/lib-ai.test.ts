@@ -191,6 +191,16 @@ test("gateway falls back after timeout and when OmniRoute is unavailable", async
   }
 });
 
+test("gateway treats a fetch transport failure as unavailable and falls back", async () => {
+  resetProviderHealthForTests();
+  let attempts = 0;
+  const primary = mockProvider("omniroute", async () => { attempts += 1; throw new TypeError("fetch failed"); });
+  const result = await createAIGateway({ providers: [primary, mockProvider("gemini", async () => success("gemini"))] })({ ...gatewayRequest });
+  assert.equal(result.provider, "gemini");
+  assert.equal(result.fallbackCount, 1);
+  assert.equal(attempts, 2);
+});
+
 test("gateway reports all providers unavailable", async () => {
   resetProviderHealthForTests();
   const down = (name: AiProvider["name"]) => mockProvider(name, async () => { throw new AiProviderError("unavailable", "down", { provider: name }); });
