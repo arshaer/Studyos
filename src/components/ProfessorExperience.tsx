@@ -16,26 +16,22 @@ const actions = [
   ["comparison", "Show comparison"],
   ["why", "Why?"],
 ] as const;
+function Inline({ text }: { text: string }) {
+  return <>{text.split(/(\*\*[^*]+\*\*|__[^_]+__|`[^`]+`)/g).filter(Boolean).map((part, index) =>
+    (part.startsWith("**") && part.endsWith("**")) || (part.startsWith("__") && part.endsWith("__"))
+      ? <strong key={index}>{part.slice(2, -2)}</strong>
+      : part.startsWith("`") && part.endsWith("`")
+        ? <code key={index}>{part.slice(1, -1)}</code>
+        : <span key={index}>{part}</span>)}</>;
+}
 function Rich({ text }: { text: string }) {
-  return (
-    <div className="rich-ai-text">
-      {String(text || "")
-        .split(/\n+/)
-        .map((line, i) => {
-          const value = line.trim();
-          if (!value) return null;
-          if (/^#{1,4}\s/.test(value))
-            return <h3 key={i}>{value.replace(/^#{1,4}\s+/, "")}</h3>;
-          if (/^[-*]\s/.test(value))
-            return (
-              <div className="professor-list-item" key={i}>
-                • {value.replace(/^[-*]\s+/, "")}
-              </div>
-            );
-          return <p key={i}>{value}</p>;
-        })}
-    </div>
-  );
+  const lines=String(text||"").replace(/\r/g,"").split("\n"),nodes=[] as React.ReactNode[];let index=0;
+  while(index<lines.length){const line=lines[index].trim();if(!line){index++;continue}
+    const heading=line.match(/^(#{1,4})\s+(.+)$/);if(heading){nodes.push(heading[1].length===1?<h2 key={index}><Inline text={heading[2]}/></h2>:<h3 key={index}><Inline text={heading[2]}/></h3>);index++;continue}
+    if(/^[-*]\s+/.test(line)){const items=[] as string[];while(index<lines.length&&/^[-*]\s+/.test(lines[index].trim())){items.push(lines[index].trim().replace(/^[-*]\s+/,""));index++}nodes.push(<ul key={`ul-${index}`}>{items.map((item,itemIndex)=><li key={itemIndex}><Inline text={item}/></li>)}</ul>);continue}
+    if(/^\d+[.)]\s+/.test(line)){const items=[] as string[];while(index<lines.length&&/^\d+[.)]\s+/.test(lines[index].trim())){items.push(lines[index].trim().replace(/^\d+[.)]\s+/,""));index++}nodes.push(<ol key={`ol-${index}`}>{items.map((item,itemIndex)=><li key={itemIndex}><Inline text={item}/></li>)}</ol>);continue}
+    const paragraph=[line];index++;while(index<lines.length&&lines[index].trim()&&!/^(#{1,4})\s+|^[-*]\s+|^\d+[.)]\s+/.test(lines[index].trim())){paragraph.push(lines[index].trim());index++}nodes.push(<p key={`p-${index}`}><Inline text={paragraph.join(" ")}/></p>)}
+  return <div className="rich-ai-text professor-prose">{nodes}</div>;
 }
 async function patch(
   lessonId: string,
