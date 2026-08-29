@@ -142,6 +142,10 @@ alter table public.professor_lessons add column if not exists provider text;
 alter table public.professor_lessons add column if not exists model text;
 alter table public.professor_lessons add column if not exists input_tokens int not null default 0;
 alter table public.professor_lessons add column if not exists output_tokens int not null default 0;
+alter table public.professor_lessons add column if not exists completed_stages_json jsonb not null default '[]'::jsonb;
+alter table public.professor_lessons add column if not exists interactions_json jsonb not null default '[]'::jsonb;
+alter table public.professor_lessons add column if not exists stage_checks_json jsonb not null default '[]'::jsonb;
+alter table public.professor_lessons add column if not exists outline_version int not null default 1;
 create table if not exists public.weak_concepts (
   id uuid primary key default gen_random_uuid(), user_id text not null, document_id uuid not null references public.documents(id) on delete cascade,
   section_id uuid not null references public.document_sections(id) on delete cascade, concept text not null, evidence text,
