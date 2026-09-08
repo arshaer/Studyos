@@ -209,7 +209,7 @@ async function generateStage(
     stages[stageIndex] = { ...stage, ...cached[0].content_json, cached: true };
     return (await db()`update public.professor_lessons set stages_json=${JSON.stringify({ ...data, stages })}::jsonb,phase='verify',updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`)[0];
   }
-  const generated = await professorProvider({ userId, documentId: String(lesson.document_id), sessionId: String(lesson.session_id), requestId: `professor-stage:${lesson.id}:${stage.id}:${lesson.outline_version}` }).generate({
+  const generated = await (await professorProvider({ userId, documentId: String(lesson.document_id), sessionId: String(lesson.session_id), requestId: `professor-stage:${lesson.id}:${stage.id}:${lesson.outline_version}` })).generate({
     mode: "tutor",
     schema: teachingSchema,
     allowedCitations: professorCitations(name, chunks),
@@ -292,7 +292,7 @@ export async function POST(request: Request) {
     const name = String(item.original_name);
     const session = await sql`insert into public.professor_sessions(user_id,document_id) values(${userId},${item.document_id}) returning id`;
     const sessionId=String(session[0].id);
-    const generated = await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}` }).generate({
+    const generated = await (await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}` })).generate({
       mode: "tutor",
       schema: outlineSchema,
       allowedCitations: professorCitations(name, chunks),

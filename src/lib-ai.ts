@@ -492,6 +492,25 @@ export function configuredAiProvider(task?: AITask, metadata: { userId?: string;
   return { name: preview.name, model: preview.model, generate: (request) => generateAI({ ...request, task: task || (request.mode === "questions" ? "quiz" : request.mode), ...metadata }) };
 }
 
+function scopedProvider(task: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string }, providers: AiProvider[]): AiProvider {
+  const preview=providers[0];
+  if(!preview) throw new AiProviderError("auth","The requested AI route is not configured",{provider:"gemini"});
+  return {name:preview.name,model:preview.model,generate:(request)=>createAIGateway({providers})({...request,task,...metadata})};
+}
+
+export function configuredFreeProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string }) {
+  const providers=configuredProviders("high","off","professor").filter(provider=>provider.name!=="openai");
+  return scopedProvider("professor",metadata,providers);
+}
+
+export function configuredPaidProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string }) {
+  const provider=(process.env.PROFESSOR_PROVIDER || "openai").trim().toLowerCase();
+  if(provider!=="openai") throw new AiProviderError("auth",`Unsupported paid Professor provider: ${provider}`,{provider:"openai"});
+  if(process.env.PROFESSOR_PAID_ENABLED!=="true") throw new AiProviderError("unavailable","Paid Professor is disabled",{provider:"openai"});
+  const free=configuredProviders("high","off","professor").filter(candidate=>candidate.name!=="openai");
+  return scopedProvider("professor",metadata,[new OpenAiProvider(),...free]);
+}
+
 const health = new Map<string, { failures: number; unhealthyUntil: number }>();
 const PRICE_PER_MILLION: Record<string, { input: number; output: number; status: "known" | "free" }> = {};
 
