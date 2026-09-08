@@ -250,6 +250,20 @@ export function ensureStudySchema() {
       await sql`create table if not exists public.ai_model_pricing(provider text not null,model text not null,version text not null,input_per_million_usd numeric(12,6) not null default 0,cached_input_per_million_usd numeric(12,6) not null default 0,output_per_million_usd numeric(12,6) not null default 0,reasoning_per_million_usd numeric(12,6) not null default 0,is_paid boolean not null default false,active boolean not null default true,updated_at timestamptz not null default now(),primary key(provider,model,version))`;
       await sql`create table if not exists public.ai_admin_config(singleton boolean primary key default true,monthly_budget_eur numeric(12,2) not null default 50,per_user_monthly_limit_eur numeric(12,2) not null default 10,usd_to_eur numeric(10,6) not null default .92,warning_thresholds_json jsonb not null default '[70,90,100]'::jsonb,professor_primary_provider text not null default 'free',professor_primary_model text,professor_fallback_provider text not null default 'free',professor_fallback_model text,budget_limit_policy text not null default 'fallback',updated_by text,updated_at timestamptz not null default now())`;
       await sql`insert into public.ai_admin_config(singleton) values(true) on conflict(singleton) do nothing`;
+      await sql`alter table public.ai_requests add column if not exists requested_tier text`;
+      await sql`alter table public.ai_requests add column if not exists underlying_provider text`;
+      await sql`alter table public.ai_requests add column if not exists route_origin text not null default 'studyos'`;
+      await sql`alter table public.ai_requests add column if not exists cache_hit boolean not null default false`;
+      await sql`alter table public.ai_admin_config add column if not exists tier_pools_json jsonb not null default '{"economy":{"models":["free"],"fallbackModels":["free"],"maxOutputTokens":350,"maxCostPerRequestUsd":0},"standard":{"models":["free"],"fallbackModels":["free"],"maxOutputTokens":650,"maxCostPerRequestUsd":0},"advanced":{"models":["free"],"fallbackModels":["free"],"maxOutputTokens":1100,"maxCostPerRequestUsd":0}}'::jsonb`;
+      await sql`alter table public.ai_admin_config add column if not exists fallback_enabled boolean not null default true`;
+      await sql`alter table public.ai_admin_config add column if not exists provider_allowlist_json jsonb not null default '["free"]'::jsonb`;
+      await sql`alter table public.ai_admin_config add column if not exists provider_denylist_json jsonb not null default '[]'::jsonb`;
+      await sql`alter table public.ai_admin_config add column if not exists require_zdr boolean not null default true`;
+      await sql`alter table public.ai_admin_config add column if not exists disallow_training boolean not null default true`;
+      await sql`alter table public.ai_admin_config add column if not exists routing_preference text not null default 'price'`;
+      await sql`alter table public.ai_admin_config add column if not exists threshold_policy text not null default 'cheaper_tier'`;
+      await sql`create or replace view public.ai_usage as select id,user_id,feature,session_id,request_id,requested_tier,model,underlying_provider,provider,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,other_billable_tokens,estimated_cost,cost_currency,pricing_version,latency_ms,success,retry_count,fallback_count,fallback_used,error_type,cache_hit,route_origin,created_at from public.ai_requests`;
+      await sql`create index if not exists ai_requests_tier_period_idx on public.ai_requests(requested_tier,created_at desc)`;
     })().catch((error) => {
       schemaReady = null;
       throw error;

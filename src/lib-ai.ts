@@ -16,6 +16,7 @@ export type AiGenerationRequest = {
   prompt: string;
   schema: Record<string, unknown>;
   source: AiSource;
+  maxOutputTokens?: number;
 };
 
 export type AiGenerationResult = {
@@ -48,7 +49,7 @@ export class AiProviderError extends Error {
 }
 
 export type AITelemetry = {
-  userId?: string; documentId?: string; requestId?: string; sessionId?: string; task: AITask; gateway: "studyos";
+  userId?: string; documentId?: string; requestId?: string; sessionId?: string; requestedTier?: string; task: AITask; gateway: "studyos";
   provider: string; model: string; inputTokens: number; outputTokens: number;
   cachedInputTokens: number; reasoningTokens: number; otherBillableTokens: number;
   estimatedCost: number | null; costStatus: "known" | "free" | "unknown";
@@ -59,7 +60,7 @@ export type AITelemetry = {
 
 export type GenerateAIRequest = AiGenerationRequest & {
   task: AITask; userId?: string; documentId?: string; quality?: AIQuality;
-  protectedContext?: boolean; requestId?: string; sessionId?: string; requirements?: { streaming?: boolean };
+  protectedContext?: boolean; requestId?: string; sessionId?: string; requestedTier?: string; requirements?: { streaming?: boolean };
 };
 
 type GatewayOptions = { providers?: AiProvider[]; persistTelemetry?: (row: AITelemetry) => Promise<void>; now?: () => number };
@@ -71,8 +72,8 @@ async function persistDefaultTelemetry(row: AITelemetry) {
   const pricing = await sql`select * from public.ai_model_pricing where provider=${row.provider} and model=${row.model} and active=true order by updated_at desc limit 1`;
   const price=pricing[0], estimated=price ? (row.inputTokens*Number(price.input_per_million_usd)+row.cachedInputTokens*Number(price.cached_input_per_million_usd)+row.outputTokens*Number(price.output_per_million_usd)+row.reasoningTokens*Number(price.reasoning_per_million_usd))/1_000_000 : row.provider==="gemini" ? 0 : row.estimatedCost;
   const costStatus=price ? "known" : row.provider==="gemini" ? "free" : row.costStatus;
-  await sql`insert into public.ai_requests(user_id,document_id,task_type,feature,gateway,provider,model,request_id,session_id,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,other_billable_tokens,estimated_cost,cost_status,latency_ms,fallback_count,retry_count,fallback_used,throttled,compression_enabled,compression_policy,compression_ratio,success,error_type)
-    values(${row.userId},${row.documentId || null},${row.task},${row.task},${row.gateway},${row.provider},${row.model},${row.requestId || null},${row.sessionId || null},${row.inputTokens},${row.cachedInputTokens},${row.outputTokens},${row.reasoningTokens},${row.otherBillableTokens},${estimated},${costStatus},${row.latencyMs},${row.fallbackCount},${row.retryCount},${row.fallbackCount > 0},${row.errorType === "rate_limit"},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType}) on conflict(request_id) where request_id is not null do nothing`;
+  await sql`insert into public.ai_requests(user_id,document_id,task_type,feature,gateway,provider,underlying_provider,model,request_id,session_id,requested_tier,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,other_billable_tokens,estimated_cost,cost_status,latency_ms,fallback_count,retry_count,fallback_used,throttled,compression_enabled,compression_policy,compression_ratio,success,error_type)
+    values(${row.userId},${row.documentId || null},${row.task},${row.task},${row.gateway},${row.provider},${row.provider},${row.model},${row.requestId || null},${row.sessionId || null},${row.requestedTier || null},${row.inputTokens},${row.cachedInputTokens},${row.outputTokens},${row.reasoningTokens},${row.otherBillableTokens},${estimated},${costStatus},${row.latencyMs},${row.fallbackCount},${row.retryCount},${row.fallbackCount > 0},${row.errorType === "rate_limit"},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType}) on conflict(request_id) where request_id is not null do nothing`;
 }
 
 const QUALITY_BY_TASK: Record<AITask, AIQuality> = {
@@ -283,7 +284,7 @@ class GeminiProvider implements AiProvider {
           systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
           contents: [{ role: "user", parts: [sourcePart, { text: `${taskFor(request.mode, request.prompt)}\n\n${plainText ? plainTextInstruction(request.allowedCitations || []) : strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}${repair ? `\n\nRETRY: ${repair}` : ""}` }] }],
           generationConfig: {
-            maxOutputTokens: request.mode === "summary" ? 8192 : 4096,
+            maxOutputTokens: Math.min(request.maxOutputTokens || (request.mode === "summary" ? 8192 : 4096), request.mode === "summary" ? 8192 : 4096),
           },
         }),
         signal: AbortSignal.timeout(55_000),
@@ -373,7 +374,7 @@ class OpenAiProvider implements AiProvider {
       body: JSON.stringify({
         model: this.model,
         store: false,
-        max_output_tokens: request.mode === "summary" ? 2200 : 1400,
+        max_output_tokens: Math.min(request.maxOutputTokens || (request.mode === "summary" ? 2200 : 1400), request.mode === "summary" ? 2200 : 1400),
         instructions: SYSTEM_INSTRUCTION,
         input: [{ role: "user", content: [source, { type: "input_text", text: taskFor(request.mode, request.prompt) }] }],
         text: { format: { type: "json_schema", name: `studyos_${request.mode}`, strict: true, schema: effectiveSchema } },
@@ -486,24 +487,24 @@ export function publicAiError(error: unknown, language = "en") {
   return { message: messages[aiError.kind], code: aiError.kind, retryAfterSeconds: aiError.options.retryAfterMs === undefined ? undefined : Math.max(1, Math.ceil(aiError.options.retryAfterMs / 1000)) };
 }
 
-export function configuredAiProvider(task?: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string } = {}): AiProvider {
+export function configuredAiProvider(task?: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string; requestedTier?: string } = {}): AiProvider {
   const effectiveTask = task || "simple_generation";
   const preview = configuredProviders(QUALITY_BY_TASK[effectiveTask], metadata.protectedContext === false ? "lite" : "off", effectiveTask)[0] || selectedProvider();
   return { name: preview.name, model: preview.model, generate: (request) => generateAI({ ...request, task: task || (request.mode === "questions" ? "quiz" : request.mode), ...metadata }) };
 }
 
-function scopedProvider(task: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string }, providers: AiProvider[]): AiProvider {
+function scopedProvider(task: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string; requestedTier?: string }, providers: AiProvider[]): AiProvider {
   const preview=providers[0];
   if(!preview) throw new AiProviderError("auth","The requested AI route is not configured",{provider:"gemini"});
   return {name:preview.name,model:preview.model,generate:(request)=>createAIGateway({providers})({...request,task,...metadata})};
 }
 
-export function configuredFreeProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string }) {
+export function configuredFreeProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string; requestedTier?: string }) {
   const providers=configuredProviders("high","off","professor").filter(provider=>provider.name!=="openai");
   return scopedProvider("professor",metadata,providers);
 }
 
-export function configuredPaidProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string }) {
+export function configuredPaidProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string; requestedTier?: string }) {
   const provider=(process.env.PROFESSOR_PROVIDER || "openai").trim().toLowerCase();
   if(provider!=="openai") throw new AiProviderError("auth",`Unsupported paid Professor provider: ${provider}`,{provider:"openai"});
   if(process.env.PROFESSOR_PAID_ENABLED!=="true") throw new AiProviderError("unavailable","Paid Professor is disabled",{provider:"openai"});
@@ -555,7 +556,7 @@ export function createAIGateway(options: GatewayOptions = {}) {
           const result = await provider.generate(request);
           health.delete(provider.name);
           const cost = estimateCost(result.model, result.usage);
-          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, task: request.task, gateway: "studyos", provider: result.provider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
+          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: result.provider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
           try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
           return { ...result, gateway: "studyos", fallbackCount, compression: { policy: compression } };
         } catch (error) {
@@ -572,7 +573,7 @@ export function createAIGateway(options: GatewayOptions = {}) {
       fallbackCount += 1;
     }
     const failure = lastError || new AiProviderError("unavailable", "All configured AI routes are unavailable", { provider: lastProvider.name });
-    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, task: request.task, gateway: "studyos", provider: lastProvider.name, model: lastProvider.model, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, otherBillableTokens: 0, estimatedCost: null, costStatus: "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
+    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: lastProvider.name, model: lastProvider.model, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, otherBillableTokens: 0, estimatedCost: null, costStatus: "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
     try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
     throw failure;
   };
