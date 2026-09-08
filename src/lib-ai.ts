@@ -99,8 +99,13 @@ export function retryDelayMs(payload: Record<string, unknown>, retryAfter?: stri
 function providerError(provider: AiGenerationResult["provider"], response: Response, payload: Record<string, unknown>) {
   const status = response.status, message = errorDetail(payload) || `${provider} generation failed`, lower = message.toLowerCase();
   const kind: AiErrorKind = status === 429 || lower.includes("quota") || lower.includes("rate limit") ? "rate_limit"
-    : status === 401 || status === 403 || lower.includes("api key") || lower.includes("permission") ? "auth"
-      : status === 404 || status === 503 || lower.includes("model") && lower.includes("unavailable") ? "unavailable" : "unknown";
+    // OpenAI-compatible routers can return the status of their final downstream
+    // attempt. A 401 paired with an unsupported/unknown model is route
+    // availability, not a bad StudyOS API key, and must advance to a direct
+    // provider. Keep genuine credential failures classified as auth.
+    : lower.includes("model") && (lower.includes("not supported") || lower.includes("unsupported") || lower.includes("not found") || lower.includes("unavailable")) ? "unavailable"
+      : status === 401 || status === 403 || lower.includes("api key") || lower.includes("permission") ? "auth"
+        : status === 404 || status === 503 ? "unavailable" : "unknown";
   return new AiProviderError(kind, message, { provider, status, retryAfterMs: retryDelayMs(payload, response.headers.get("retry-after")) });
 }
 

@@ -269,3 +269,55 @@ test("OmniRoute requests a complete non-streaming response", async () => {
     delete process.env.OMNIROUTE_API_KEY;
   }
 });
+
+test("OmniRoute unsupported-model 401 falls back to a configured direct provider", async () => {
+  resetProviderHealthForTests();
+  process.env.OMNIROUTE_BASE_URL = "https://omniroute.example/v1";
+  process.env.OMNIROUTE_API_KEY = "test-only";
+  process.env.GEMINI_API_KEY = "test-only";
+  process.env.AI_MAX_RETRIES = "0";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) =>
+    String(input).includes("omniroute.example")
+      ? new Response(JSON.stringify({ error: { message: "[401]: Model hy3-free is not supported [oc/big-pickle (400), oc/hy3-free (401)]" } }), { status: 401 })
+      : new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ title: "Direct fallback", content: "Grounded", citations: [], followUps: [] }) }] } }] }), { status: 200 })) as typeof fetch;
+  try {
+    const result = await configuredAiProvider("professor").generate(gatewayRequest);
+    assert.equal(result.provider, "gemini");
+    assert.equal(result.fallbackCount, 1);
+    assert.equal(result.result.title, "Direct fallback");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OMNIROUTE_BASE_URL;
+    delete process.env.OMNIROUTE_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.AI_MAX_RETRIES;
+  }
+});
+
+test("OmniRoute genuine credential 401 remains an auth failure", async () => {
+  resetProviderHealthForTests();
+  process.env.OMNIROUTE_BASE_URL = "https://omniroute.example/v1";
+  process.env.OMNIROUTE_API_KEY = "bad-key";
+  process.env.GEMINI_API_KEY = "test-only";
+  process.env.AI_MAX_RETRIES = "0";
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ error: { message: "Invalid API key" } }), { status: 401 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      configuredAiProvider("professor").generate(gatewayRequest),
+      (error: unknown) => error instanceof AiProviderError && error.kind === "auth",
+    );
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OMNIROUTE_BASE_URL;
+    delete process.env.OMNIROUTE_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.AI_MAX_RETRIES;
+  }
+});
