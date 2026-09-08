@@ -31,8 +31,9 @@ export async function professorProvider(context: ProfessorProviderContext): Prom
     return free();
   }
   if(process.env.OPENROUTER_ENABLED!=="true" || !process.env.OPENROUTER_API_KEY?.trim() || String(config.professor_primary_provider)!=="openrouter") return free();
+  if(!policy.requireZdr||!policy.disallowTraining) throw new AiProviderError("auth","Professor privacy requirements cannot be weakened",{provider:"openrouter"});
   const underlying=policy.providerAllowlist.filter(provider=>provider!=="free"&&provider!=="openrouter");
   if(!underlying.length) throw new AiProviderError("auth","No approved OpenRouter provider is configured",{provider:"openrouter"});
-  const paid=configuredOpenRouterProfessorProvider({...context,requestedTier:context.tier},{models:tierPolicy.models,underlyingProviders:underlying,deniedProviders:policy.providerDenylist,allowFallbacks:policy.fallbackEnabled,requireZdr:policy.requireZdr,routingPreference:policy.routingPreference,sessionId:context.sessionId});
+  const paid=configuredOpenRouterProfessorProvider({...context,requestedTier:context.tier},{models:tierPolicy.models,underlyingProviders:underlying,deniedProviders:policy.providerDenylist,allowFallbacks:policy.fallbackEnabled,requireZdr:policy.requireZdr,routingPreference:policy.routingPreference,maxCostPerRequestUsd:tierPolicy.maxCostPerRequestUsd,sessionId:context.sessionId});
   return {name:paid.name,model:paid.model,generate:request=>paid.generate({...request,maxOutputTokens:Math.min(request.maxOutputTokens||tierPolicy.maxOutputTokens,tierPolicy.maxOutputTokens)})};
 }

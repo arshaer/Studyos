@@ -513,7 +513,7 @@ export function configuredPaidProfessorProvider(metadata: { userId: string; docu
   return scopedProvider("professor",metadata,[new OpenAiProvider(),...free]);
 }
 
-export type OpenRouterRoute = { models: string[]; underlyingProviders: string[]; deniedProviders: string[]; allowFallbacks: boolean; requireZdr: boolean; routingPreference: "price" | "latency" | "throughput"; sessionId: string };
+export type OpenRouterRoute = { models: string[]; underlyingProviders: string[]; deniedProviders: string[]; allowFallbacks: boolean; requireZdr: boolean; routingPreference: "price" | "latency" | "throughput"; maxCostPerRequestUsd: number; sessionId: string };
 
 export class OpenRouterProvider implements AiProvider {
   readonly name = "openrouter" as const;
@@ -528,7 +528,7 @@ export class OpenRouterProvider implements AiProvider {
     const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "http-referer": process.env.NEXT_PUBLIC_APP_URL?.trim() || "https://studyos-beryl.vercel.app", "x-title": "StudyOS Professor" },
+      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "http-referer": process.env.NEXT_PUBLIC_APP_URL?.trim() || "https://studyos-beryl.vercel.app", "x-openrouter-title": "StudyOS Professor" },
       body: JSON.stringify({
         model: this.model, models: this.route.models.slice(1), session_id: this.route.sessionId,
         messages: [
@@ -538,7 +538,7 @@ export class OpenRouterProvider implements AiProvider {
         ],
         response_format: { type: "json_schema", json_schema: { name: "studyos_professor", strict: true, schema: effectiveSchema } },
         max_tokens: request.maxOutputTokens || 650,
-        provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference },
+        provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference, ...(this.route.maxCostPerRequestUsd>0?{max_price:{request:this.route.maxCostPerRequestUsd}}:{}) },
       }), signal: AbortSignal.timeout(55_000),
     });
     const payload = await response.json() as Record<string, any>;

@@ -332,13 +332,14 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
     return new Response(JSON.stringify({ model: "vendor/cheap", provider: "Vendor A", choices: [{ message: { content: JSON.stringify({ title: "Answer", content: "Grounded", citations: [], followUps: [] }) } }], usage: { prompt_tokens: 20, completion_tokens: 8, cost: 0.001, prompt_tokens_details: { cached_tokens: 10 }, completion_tokens_details: { reasoning_tokens: 2 } } }), { status: 200 });
   }) as typeof fetch;
   try {
-    const provider = new OpenRouterProvider({ models: ["vendor/cheap", "vendor/cheap-fallback"], underlyingProviders: ["vendor-a"], deniedProviders: ["vendor-b"], allowFallbacks: true, requireZdr: true, routingPreference: "price", sessionId: "session-1" });
+    const provider = new OpenRouterProvider({ models: ["vendor/cheap", "vendor/cheap-fallback"], underlyingProviders: ["vendor-a"], deniedProviders: ["vendor-b"], allowFallbacks: true, requireZdr: true, routingPreference: "price", maxCostPerRequestUsd: 0.02, sessionId: "session-1" });
     const result = await provider.generate({ ...gatewayRequest, maxOutputTokens: 300 });
     assert.deepEqual(body.models, ["vendor/cheap-fallback"]);
     assert.deepEqual(body.provider.only, ["vendor-a"]);
     assert.deepEqual(body.provider.ignore, ["vendor-b"]);
     assert.equal(body.provider.data_collection, "deny");
     assert.equal(body.provider.zdr, true);
+    assert.equal(body.provider.max_price.request, 0.02);
     assert.equal(body.max_tokens, 300);
     assert.equal(result.usage.cached_input_tokens, 10);
     assert.equal(result.usage.actual_cost_usd, 0.001);
