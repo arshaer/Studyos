@@ -22,7 +22,7 @@ export type AiGenerationResult = {
   provider: "omniroute" | "gemini" | "openai";
   model: string;
   result: Record<string, unknown>;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number; reasoning_tokens?: number; other_billable_tokens?: number };
   gateway?: "studyos";
   fallbackCount?: number;
   compression?: { policy: CompressionPolicy; ratio?: number };
@@ -48,17 +48,18 @@ export class AiProviderError extends Error {
 }
 
 export type AITelemetry = {
-  userId?: string; documentId?: string; task: AITask; gateway: "studyos";
+  userId?: string; documentId?: string; requestId?: string; sessionId?: string; task: AITask; gateway: "studyos";
   provider: string; model: string; inputTokens: number; outputTokens: number;
+  cachedInputTokens: number; reasoningTokens: number; otherBillableTokens: number;
   estimatedCost: number | null; costStatus: "known" | "free" | "unknown";
   latencyMs: number; fallbackCount: number; compressionEnabled: boolean;
   compressionPolicy: CompressionPolicy; compressionRatio: number | null;
-  success: boolean; errorType: AiErrorKind | null;
+  retryCount: number; success: boolean; errorType: AiErrorKind | null;
 };
 
 export type GenerateAIRequest = AiGenerationRequest & {
   task: AITask; userId?: string; documentId?: string; quality?: AIQuality;
-  protectedContext?: boolean; requirements?: { streaming?: boolean };
+  protectedContext?: boolean; requestId?: string; sessionId?: string; requirements?: { streaming?: boolean };
 };
 
 type GatewayOptions = { providers?: AiProvider[]; persistTelemetry?: (row: AITelemetry) => Promise<void>; now?: () => number };
@@ -67,8 +68,11 @@ async function persistDefaultTelemetry(row: AITelemetry) {
   if (!row.userId) return;
   const { db } = await import("./lib-db");
   const sql = db();
-  await sql`insert into public.ai_requests(user_id,document_id,task_type,gateway,provider,model,input_tokens,output_tokens,estimated_cost,cost_status,latency_ms,fallback_count,compression_enabled,compression_policy,compression_ratio,success,error_type)
-    values(${row.userId},${row.documentId || null},${row.task},${row.gateway},${row.provider},${row.model},${row.inputTokens},${row.outputTokens},${row.estimatedCost},${row.costStatus},${row.latencyMs},${row.fallbackCount},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType})`;
+  const pricing = await sql`select * from public.ai_model_pricing where provider=${row.provider} and model=${row.model} and active=true order by updated_at desc limit 1`;
+  const price=pricing[0], estimated=price ? (row.inputTokens*Number(price.input_per_million_usd)+row.cachedInputTokens*Number(price.cached_input_per_million_usd)+row.outputTokens*Number(price.output_per_million_usd)+row.reasoningTokens*Number(price.reasoning_per_million_usd))/1_000_000 : row.provider==="gemini" ? 0 : row.estimatedCost;
+  const costStatus=price ? "known" : row.provider==="gemini" ? "free" : row.costStatus;
+  await sql`insert into public.ai_requests(user_id,document_id,task_type,feature,gateway,provider,model,request_id,session_id,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,other_billable_tokens,estimated_cost,cost_status,latency_ms,fallback_count,retry_count,fallback_used,throttled,compression_enabled,compression_policy,compression_ratio,success,error_type)
+    values(${row.userId},${row.documentId || null},${row.task},${row.task},${row.gateway},${row.provider},${row.model},${row.requestId || null},${row.sessionId || null},${row.inputTokens},${row.cachedInputTokens},${row.outputTokens},${row.reasoningTokens},${row.otherBillableTokens},${estimated},${costStatus},${row.latencyMs},${row.fallbackCount},${row.retryCount},${row.fallbackCount > 0},${row.errorType === "rate_limit"},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType}) on conflict(request_id) where request_id is not null do nothing`;
 }
 
 const QUALITY_BY_TASK: Record<AITask, AIQuality> = {
@@ -482,9 +486,9 @@ export function publicAiError(error: unknown, language = "en") {
   return { message: messages[aiError.kind], code: aiError.kind, retryAfterSeconds: aiError.options.retryAfterMs === undefined ? undefined : Math.max(1, Math.ceil(aiError.options.retryAfterMs / 1000)) };
 }
 
-export function configuredAiProvider(task?: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean } = {}): AiProvider {
+export function configuredAiProvider(task?: AITask, metadata: { userId?: string; documentId?: string; protectedContext?: boolean; requestId?: string; sessionId?: string } = {}): AiProvider {
   const effectiveTask = task || "simple_generation";
-  const preview = configuredProviders(QUALITY_BY_TASK[effectiveTask], metadata.protectedContext === false ? "lite" : "off")[0] || selectedProvider();
+  const preview = configuredProviders(QUALITY_BY_TASK[effectiveTask], metadata.protectedContext === false ? "lite" : "off", effectiveTask)[0] || selectedProvider();
   return { name: preview.name, model: preview.model, generate: (request) => generateAI({ ...request, task: task || (request.mode === "questions" ? "quiz" : request.mode), ...metadata }) };
 }
 
@@ -498,11 +502,13 @@ function estimateCost(model: string, usage: AiGenerationResult["usage"]) {
   return { estimatedCost, costStatus: pricing.status };
 }
 
-function configuredProviders(quality: AIQuality, compression: CompressionPolicy): AiProvider[] {
+function configuredProviders(quality: AIQuality, compression: CompressionPolicy, task: AITask): AiProvider[] {
   const direct: AiProvider[] = [];
   const preferred = process.env.AI_PROVIDER?.trim().toLowerCase();
   if (process.env.GEMINI_API_KEY?.trim()) direct.push(new GeminiProvider());
-  if (process.env.OPENAI_API_KEY?.trim()) direct.push(new OpenAiProvider());
+  // Tutor, Flashcards and routine tasks are intentionally isolated from paid
+  // providers. Professor obtains its provider through its own adapter.
+  if (task === "professor" && process.env.PROFESSOR_PAID_ENABLED === "true" && process.env.OPENAI_API_KEY?.trim()) direct.push(new OpenAiProvider());
   if (preferred === "openai") direct.sort((a) => a.name === "openai" ? -1 : 1);
   const omni = process.env.OMNIROUTE_BASE_URL?.trim() && process.env.OMNIROUTE_API_KEY?.trim()
     ? [new OmniRouteProvider(quality, compression)] : [];
@@ -514,10 +520,11 @@ export function createAIGateway(options: GatewayOptions = {}) {
     const started = (options.now || Date.now)();
     const quality = request.quality || QUALITY_BY_TASK[request.task];
     const compression = compressionPolicyFor(request);
-    const providers = options.providers || configuredProviders(quality, compression);
+    const providers = options.providers || configuredProviders(quality, compression, request.task);
     if (!providers.length) throw new AiProviderError("auth", "No AI provider is configured", { provider: "gemini" });
     const maxRetries = Math.max(0, Math.min(2, Number(process.env.AI_MAX_RETRIES ?? 1)));
     let fallbackCount = 0;
+    let retryCount = 0;
     let lastError: AiProviderError | undefined;
     let lastProvider = providers[0];
     for (let providerIndex = 0; providerIndex < providers.length; providerIndex += 1) {
@@ -529,12 +536,13 @@ export function createAIGateway(options: GatewayOptions = {}) {
           const result = await provider.generate(request);
           health.delete(provider.name);
           const cost = estimateCost(result.model, result.usage);
-          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, task: request.task, gateway: "studyos", provider: result.provider, model: result.model, inputTokens: result.usage.input_tokens, outputTokens: result.usage.output_tokens, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
+          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, task: request.task, gateway: "studyos", provider: result.provider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
           try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
           return { ...result, gateway: "studyos", fallbackCount, compression: { policy: compression } };
         } catch (error) {
           lastError = normalizeProviderError(provider.name, error);
           if (!transientKinds.has(lastError.kind) || attempt === maxRetries) break;
+          retryCount += 1;
           const base = Math.min(lastError.options.retryAfterMs ?? 1_000 * 2 ** attempt, 8_000);
           await sleep(base);
         }
@@ -545,7 +553,7 @@ export function createAIGateway(options: GatewayOptions = {}) {
       fallbackCount += 1;
     }
     const failure = lastError || new AiProviderError("unavailable", "All configured AI routes are unavailable", { provider: lastProvider.name });
-    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, task: request.task, gateway: "studyos", provider: lastProvider.name, model: lastProvider.model, inputTokens: 0, outputTokens: 0, estimatedCost: null, costStatus: "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
+    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, task: request.task, gateway: "studyos", provider: lastProvider.name, model: lastProvider.model, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, otherBillableTokens: 0, estimatedCost: null, costStatus: "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
     try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
     throw failure;
   };

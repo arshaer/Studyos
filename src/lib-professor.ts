@@ -13,6 +13,9 @@ export const PROFESSOR_ACTIONS = [
   "why",
 ] as const;
 export type ProfessorAction = (typeof PROFESSOR_ACTIONS)[number];
+export type LearningState = "not_seen" | "learning" | "understood" | "exam_ready" | "mastered";
+export type ProfessorPhase = "teach" | "verify" | "connect" | "exam_test" | "reteach" | "advance";
+export type ExamFormat = "oral" | "mcq" | "written" | "calculations" | "mixed";
 
 export type ProfessorStage = {
   id: string;
@@ -24,6 +27,8 @@ export type ProfessorStage = {
   check?: string;
   citations?: string[];
   generatedAt?: string;
+  conceptId?: string;
+  cached?: boolean;
 };
 
 export function isProfessorAction(value: unknown): value is ProfessorAction {
@@ -93,4 +98,43 @@ export function actionInstruction(action: ProfessorAction) {
       "Compare the current concept with the most relevant related or commonly confused concept. Use a compact Markdown table when it improves clarity.",
     why: "Explain the causal or mechanistic reason behind the current concept. Build a clear because-therefore chain instead of restating it.",
   }[action];
+}
+
+export function learningStateForScore(score: number, examStyle = false): LearningState {
+  if (score >= 90) return "mastered";
+  if (score >= 75) return examStyle ? "exam_ready" : "understood";
+  if (score >= 55) return "understood";
+  return "learning";
+}
+
+export function shouldReteach(verdict: string) {
+  return verdict === "needs_review" || verdict === "incorrect";
+}
+
+export function nextAdaptivePhase(phase: ProfessorPhase, verdict?: string): ProfessorPhase {
+  if (phase === "verify") return shouldReteach(String(verdict)) ? "reteach" : "connect";
+  if (phase === "reteach") return "verify";
+  if (phase === "connect") return "exam_test";
+  if (phase === "exam_test") return shouldReteach(String(verdict)) ? "reteach" : "advance";
+  if (phase === "advance") return "teach";
+  return "verify";
+}
+
+export function isNearExam(examDate?: string | null, now = new Date()) {
+  if (!examDate) return false;
+  const days = (new Date(`${examDate}T23:59:59Z`).getTime() - now.getTime()) / 86_400_000;
+  return days >= 0 && days <= 14;
+}
+
+export function selectRetrievalChunks(chunks: StoredChunk[], stage: ProfessorStage, excludedIndexes: number[] = [], limit = 6) {
+  const excluded = new Set(excludedIndexes.map(Number));
+  return chunksForStage(chunks, stage).filter(chunk => !excluded.has(Number(chunk.chunk_index))).slice(0, limit);
+}
+
+export function compactRecentTurns(turns: unknown[], limit = 6) {
+  return turns.slice(-limit).map((turn: any) => ({
+    role: String(turn?.role || "system").slice(0, 20),
+    phase: String(turn?.phase || "").slice(0, 20),
+    text: String(turn?.text || turn?.content || "").slice(0, 900),
+  }));
 }

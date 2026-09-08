@@ -56,8 +56,11 @@ export function ProfessorExperience({ task }: Props) {
     [answer, setAnswer] = useState(""),
     [doubt, setDoubt] = useState(""),
     [masteryAnswers, setMasteryAnswers] = useState<string[]>([]),
-    [result, setResult] = useState<any>(null);
-  async function load() {
+    [result, setResult] = useState<any>(null),
+    [started,setStarted]=useState(false),
+    [quickVerification,setQuickVerification]=useState<any>(null),
+    [examProfile,setExamProfile]=useState({examDate:"",examFormat:"mixed",confidence:"medium",availableStudyDays:"",professorNotes:""});
+  async function load(profile=examProfile) {
     if (!task) return;
     setBusy("load");
     setError("");
@@ -65,7 +68,7 @@ export function ProfessorExperience({ task }: Props) {
       const response = await fetch("/api/professor", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ taskId: task.id }),
+          body: JSON.stringify({ taskId: task.id, examProfile: profile }),
         }),
         data = await response.json();
       if (!response.ok) throw data;
@@ -82,9 +85,7 @@ export function ProfessorExperience({ task }: Props) {
       setBusy("");
     }
   }
-  useEffect(() => {
-    void load();
-  }, [task?.id]);
+  useEffect(() => { setStarted(false); setLesson(null); }, [task?.id]);
   if (!task)
     return (
       <>
@@ -96,6 +97,17 @@ export function ProfessorExperience({ task }: Props) {
         <div className="panel empty-row">Choose Start lesson from Tutor.</div>
       </>
     );
+  if(!started) return <>
+    <div className="page-title"><span>PROFESSOR · EXAM SETUP</span><h1>Prepare for your real exam</h1><p>Professor adapts teaching, recall, and practice to this target. You can leave unknown details blank.</p></div>
+    <form className="panel professor-onboarding" onSubmit={event=>{event.preventDefault();setStarted(true);void load();}}>
+      <label>Exam date (optional)<input type="date" value={examProfile.examDate} onChange={e=>setExamProfile(p=>({...p,examDate:e.target.value}))}/></label>
+      <label>Exam format<select value={examProfile.examFormat} onChange={e=>setExamProfile(p=>({...p,examFormat:e.target.value}))}><option value="oral">Oral</option><option value="mcq">Multiple choice</option><option value="written">Written open-answer</option><option value="calculations">Calculations / problems</option><option value="mixed">Mixed</option></select></label>
+      <label>Current confidence<select value={examProfile.confidence} onChange={e=>setExamProfile(p=>({...p,confidence:e.target.value}))}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+      <label>Available study days<input type="number" min="1" value={examProfile.availableStudyDays} onChange={e=>setExamProfile(p=>({...p,availableStudyDays:e.target.value}))}/></label>
+      <label className="wide">Professor notes or past-question clues (optional)<textarea value={examProfile.professorNotes} onChange={e=>setExamProfile(p=>({...p,professorNotes:e.target.value}))}/></label>
+      <button className="primary">Begin adaptive lesson</button>
+    </form>
+  </>;
   const data = lesson?.stages_json || {},
     stages = data.stages || [],
     index = Number(lesson?.current_stage || 0),
@@ -118,6 +130,7 @@ export function ProfessorExperience({ task }: Props) {
         ...extra,
       });
       if (response.lesson) setLesson(response.lesson);
+      if(response.quickVerification)setQuickVerification(response.quickVerification);
       return response;
     } catch (caught: any) {
       setError(
@@ -243,7 +256,12 @@ export function ProfessorExperience({ task }: Props) {
                         {busy === action ? "Teaching…" : label}
                       </button>
                     ))}
+                    <button disabled={Boolean(busy)} onClick={() => void run("explain_differently")}>Explain differently</button>
+                    <button disabled={Boolean(busy)} onClick={() => void run("test_me")}>Test me</button>
+                    <button disabled={Boolean(busy)} onClick={() => void run("exam_appearance")}>How could this appear on my exam?</button>
                   </div>
+                  <div className="professor-primary-actions"><button className="secondary" disabled={Boolean(busy)} onClick={()=>void run("skip")}>Skip · I already know this</button></div>
+                  {quickVerification?<section className="concept-box skip-check"><b>Optional 15-second check</b><p>{quickVerification.question}</p><small>Answer through the comprehension check below, or force-skip. A failed check flags a gap but never traps you here.</small><button className="secondary" disabled={Boolean(busy)} onClick={()=>void run("force_skip")}>Force skip anyway</button></section>:null}
                   <section className="concept-box checkpoint-box">
                     <b>Comprehension check</b>
                     <p>{stage.check}</p>
@@ -282,7 +300,7 @@ export function ProfessorExperience({ task }: Props) {
                   >
                     {busy === "stage"
                       ? "Preparing next concept…"
-                      : index === stages.length - 1
+                      : check?.verdict === "needs_review" ? "Repair this gap before continuing" : index === stages.length - 1
                         ? "I understand · begin final review"
                         : "I understand · continue"}
                   </button>
@@ -372,7 +390,7 @@ export function ProfessorExperience({ task }: Props) {
                       : "Complete mastery check"}
                   </button>
                   {result ? (
-                    <div
+              <div
                       className={`result ${result.status === "mastered" ? "correct" : "wrong"}`}
                     >
                       <b>
@@ -399,6 +417,7 @@ export function ProfessorExperience({ task }: Props) {
                       ? "✓"
                       : i + 1}
                   </b>
+                  {x.cached?<small>cached</small>:null}
                 </div>
               ))}
             </div>

@@ -150,13 +150,13 @@ test("retries one Gemini 429 and succeeds without exposing quota details", async
   finally { globalThis.fetch = originalFetch; delete process.env.GEMINI_API_KEY; delete process.env.AI_PROVIDER; delete process.env.AI_MAX_RETRIES; }
 });
 
-test("falls back to configured OpenAI after bounded Gemini rate limit", async () => {
+test("Tutor never falls back to the configured paid OpenAI provider", async () => {
   process.env.AI_PROVIDER = "gemini"; process.env.GEMINI_API_KEY = "test-only"; process.env.OPENAI_API_KEY = "test-only"; process.env.AI_MAX_RETRIES = "0";
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => String(input).includes("googleapis")
     ? new Response(JSON.stringify({ error: { code: 429, message: "quota exhausted" } }), { status: 429 })
     : new Response(JSON.stringify({ output_text: JSON.stringify({ title: "Fallback", content: "Available", citations: [], followUps: [] }), usage: { input_tokens: 7, output_tokens: 3 } }), { status: 200 })) as typeof fetch;
-  try { const result = await configuredAiProvider().generate({ mode: "tutor", prompt: "help", schema: tutorSchema, source: { mimeType: "text/plain", name: "notes.pdf", text: "source" } }); assert.equal(result.provider, "openai"); assert.equal(result.result.title, "Fallback"); assert.deepEqual(result.usage, { input_tokens: 7, output_tokens: 3 }); }
+  try { await assert.rejects(configuredAiProvider("tutor").generate({ mode: "tutor", prompt: "help", schema: tutorSchema, source: { mimeType: "text/plain", name: "notes.pdf", text: "source" } }), (error:any)=>error.kind==="rate_limit"); }
   finally { globalThis.fetch = originalFetch; delete process.env.GEMINI_API_KEY; delete process.env.OPENAI_API_KEY; delete process.env.AI_PROVIDER; delete process.env.AI_MAX_RETRIES; }
 });
 

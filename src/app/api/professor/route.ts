@@ -1,10 +1,15 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { configuredAiProvider, publicAiError } from "@/lib-ai";
+import { professorProvider } from "@/lib-professor-provider";
 import type { StoredChunk } from "@/lib-document-processing";
 import {
   actionInstruction,
   chunksForStage,
+  compactRecentTurns,
+  isNearExam,
   isProfessorAction,
+  learningStateForScore,
   nextLessonState,
   professorCitations,
   professorSource,
@@ -147,7 +152,7 @@ async function sectionChunks(
 async function ownedTask(userId: string, taskId: string) {
   const sql = db(),
     rows =
-      await sql`select t.id,t.document_id,t.section_id,t.title,s.title section_title,s.page_start,s.page_end,d.original_name from public.study_plan_tasks t join public.document_sections s on s.id=t.section_id and s.user_id=t.user_id join public.documents d on d.id=t.document_id and d.user_id=t.user_id where t.id=${taskId} and t.user_id=${userId}`;
+      await sql`select t.id,t.document_id,t.section_id,t.title,s.title section_title,s.page_start,s.page_end,d.original_name,d.index_version from public.study_plan_tasks t join public.document_sections s on s.id=t.section_id and s.user_id=t.user_id join public.documents d on d.id=t.document_id and d.user_id=t.user_id where t.id=${taskId} and t.user_id=${userId}`;
   if (!rows[0]) throw new Error("Study-plan section not found");
   return {
     item: rows[0],
@@ -162,7 +167,7 @@ async function ownedTask(userId: string, taskId: string) {
 async function lessonContext(userId: string, lessonId: string) {
   const sql = db(),
     rows =
-      await sql`select l.*,s.title section_title,s.page_start,s.page_end,d.original_name from public.professor_lessons l join public.document_sections s on s.id=l.section_id and s.user_id=l.user_id join public.documents d on d.id=l.document_id and d.user_id=l.user_id where l.id=${lessonId} and l.user_id=${userId}`;
+      await sql`select l.*,s.title section_title,s.page_start,s.page_end,d.original_name,d.index_version source_version from public.professor_lessons l join public.document_sections s on s.id=l.section_id and s.user_id=l.user_id join public.documents d on d.id=l.document_id and d.user_id=l.user_id where l.id=${lessonId} and l.user_id=${userId}`;
   if (!rows[0]) return null;
   const lesson = rows[0],
     [profiles, course, chunks] = await Promise.all([
@@ -190,7 +195,7 @@ async function generateStage(
       : [],
     stage = stages[stageIndex];
   if (!stage || stage.content) return lesson;
-  const chunks = chunksForStage(allChunks, stage),
+  const chunks = chunksForStage(allChunks, stage).slice(0, 6),
     name = String(lesson.original_name || "source"),
     recent = stages
       .slice(Math.max(0, stageIndex - 2), stageIndex)
@@ -198,15 +203,17 @@ async function generateStage(
         title: item.title,
         content: item.content?.slice(-1800),
       }));
-  const generated = await configuredAiProvider("professor", {
-    userId,
-    documentId: String(lesson.document_id),
-    protectedContext: true,
-  }).generate({
+  const cacheKey = createHash("sha256").update(JSON.stringify({ documentId: lesson.document_id, version: lesson.source_version || 1, concept: stage.id, language: pref.teaching_language || pref.preferred_language || "it", depth: pref.explanation_depth || "adaptive" })).digest("hex");
+  const cached = await db()`select content_json from public.professor_content_cache where cache_key=${cacheKey} and user_id=${userId} limit 1`;
+  if (cached[0]) {
+    stages[stageIndex] = { ...stage, ...cached[0].content_json, cached: true };
+    return (await db()`update public.professor_lessons set stages_json=${JSON.stringify({ ...data, stages })}::jsonb,phase='verify',updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`)[0];
+  }
+  const generated = await professorProvider({ userId, documentId: String(lesson.document_id), sessionId: String(lesson.session_id), requestId: `professor-stage:${lesson.id}:${stage.id}:${lesson.outline_version}` }).generate({
     mode: "tutor",
     schema: teachingSchema,
     allowedCitations: professorCitations(name, chunks),
-    prompt: `Teach concept ${stageIndex + 1} of ${stages.length} in a complete private-university lesson. Language: ${pref.teaching_language || pref.preferred_language || "it"}; learner level: ${pref.academic_level || pref.current_level || "beginner"}; style: ${pref.study_style || "mixed"}; depth: ${pref.explanation_depth || "adaptive"}. Concept: ${stage.title}. Purpose: ${stage.purpose}. Key terms: ${stage.keyTerms.join(", ")}. Explain definitions, mechanisms, cause/effect, relationships, terminology, meaningful examples, grounded clinical/exam implications, and common confusions. Preserve scientific names, numbers, equations, qualifiers and exceptions. Produce a substantial structured teaching segment, normally 700-1200 Italian words for a substantive concept; never a summary or paragraph-by-paragraph paraphrase. Use headings and lists. End with one meaningful comprehension question. Recent lesson memory: ${JSON.stringify(recent)}.`,
+    prompt: `Teach this concept naturally as one concise adaptive university teaching turn. Language: ${pref.teaching_language || pref.preferred_language || "it"}; level: ${pref.academic_level || pref.current_level || "beginner"}; style: ${pref.study_style || "mixed"}; depth: ${pref.explanation_depth || "adaptive"}. Concept: ${stage.title}. Purpose: ${stage.purpose}. Key terms: ${stage.keyTerms.join(", ")}. Use the source as curriculum, preserve exact technical details, highlight one exam-relevant trap or connection, and finish with one diagnostic comprehension question. Prefer 200-500 output tokens; do not use rigid Step 1/Step 2 formatting. Recent compact memory: ${JSON.stringify(compactRecentTurns(recent))}.`,
     source: {
       mimeType: "text/plain",
       name,
@@ -221,8 +228,9 @@ async function generateStage(
     citations: value.citations,
     generatedAt: new Date().toISOString(),
   };
+  await db()`insert into public.professor_content_cache(user_id,document_id,cache_key,concept_id,language,depth,source_version,content_json,provider,model) values(${userId},${lesson.document_id},${cacheKey},${lesson.current_concept_id || null},${pref.teaching_language || pref.preferred_language || "it"},${pref.explanation_depth || "adaptive"},${Number(lesson.source_version || 1)},${JSON.stringify({content:value.content,check:value.check,citations:value.citations,generatedAt:new Date().toISOString()})}::jsonb,${generated.provider},${generated.model}) on conflict(cache_key) do update set last_used_at=now()`;
   return (
-    await db()`update public.professor_lessons set stages_json=${JSON.stringify({ ...data, stages })}::jsonb,provider=${generated.provider},model=${generated.model},input_tokens=input_tokens+${generated.usage.input_tokens},output_tokens=output_tokens+${generated.usage.output_tokens},updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`
+    await db()`update public.professor_lessons set stages_json=${JSON.stringify({ ...data, stages })}::jsonb,phase='verify',provider=${generated.provider},model=${generated.model},input_tokens=input_tokens+${generated.usage.input_tokens},output_tokens=output_tokens+${generated.usage.output_tokens},updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`
   )[0];
 }
 
@@ -249,13 +257,20 @@ export async function POST(request: Request) {
     if (!userId)
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     await ensureStudySchema();
-    const { taskId } = await request.json(),
+    const body = await request.json(), { taskId } = body,
       sql = db(),
       { item, chunks } = await ownedTask(userId, String(taskId));
+    if (body.examProfile) {
+      const exam = body.examProfile;
+      await sql`insert into public.course_exam_profiles(user_id,document_id,exam_date,exam_format,confidence,available_study_days,professor_notes) values(${userId},${item.document_id},${exam.examDate || null},${String(exam.examFormat || "mixed")},${String(exam.confidence || "medium")},${Number(exam.availableStudyDays) || null},${String(exam.professorNotes || "").slice(0,4000) || null}) on conflict(user_id,document_id) do update set exam_date=excluded.exam_date,exam_format=excluded.exam_format,confidence=excluded.confidence,available_study_days=excluded.available_study_days,professor_notes=excluded.professor_notes,updated_at=now()`;
+    }
     const existing =
       await sql`select l.*,d.original_name from public.professor_lessons l join public.documents d on d.id=l.document_id where l.user_id=${userId} and l.document_id=${item.document_id} and l.section_id=${item.section_id}`;
-    if (existing[0] && Number(existing[0].outline_version || 1) >= 2)
-      return NextResponse.json({ lesson: existing[0], section: item });
+    if (existing[0] && Number(existing[0].outline_version || 1) >= 3) {
+      let resumed=existing[0];
+      if(!resumed.session_id){const session=await sql`insert into public.professor_sessions(user_id,document_id,lesson_id) values(${userId},${item.document_id},${resumed.id}) returning id`;resumed=(await sql`update public.professor_lessons set session_id=${session[0].id} where id=${resumed.id} returning *`)[0];}
+      return NextResponse.json({ lesson: resumed, section: item });
+    }
     // Version-one lessons were generated as one shallow response. Re-plan them once
     // from the full indexed section so existing production users receive the staged lesson.
     if (existing[0])
@@ -265,24 +280,23 @@ export async function POST(request: Request) {
         { error: "This indexed section has no readable source chunks" },
         { status: 409 },
       );
-    const [profiles, course] = await Promise.all([
+    const [profiles, course, exams] = await Promise.all([
       sql`select * from public.user_profiles where user_id=${userId}`,
       sql`select current_level,study_style,preferred_language from public.tutor_profiles where user_id=${userId} and document_id=${item.document_id}`,
+      sql`select * from public.course_exam_profiles where user_id=${userId} and document_id=${item.document_id}`,
     ]);
-    const pref = { ...profiles[0], ...course[0] };
+    const pref = { ...profiles[0], ...course[0], ...exams[0] };
     language = String(
       pref.teaching_language || pref.preferred_language || "it",
     );
     const name = String(item.original_name);
-    const generated = await configuredAiProvider("professor", {
-      userId,
-      documentId: String(item.document_id),
-      protectedContext: true,
-    }).generate({
+    const session = await sql`insert into public.professor_sessions(user_id,document_id) values(${userId},${item.document_id}) returning id`;
+    const sessionId=String(session[0].id);
+    const generated = await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}` }).generate({
       mode: "tutor",
       schema: outlineSchema,
       allowedCitations: professorCitations(name, chunks),
-      prompt: `Inspect the complete indexed section before planning. Design a comprehensive, pedagogically coherent private-university lesson in ${language} for level ${pref.academic_level || pref.current_level || "beginner"}. Section: ${item.section_title}, pages ${item.page_start}-${item.page_end}; ${chunks.length} original chunks. Cover the entire section, not just its opening. Create 4-10 stages proportional to scope, each tied to exact CHUNK numbers. Objectives and concept map must cover definitions, mechanisms, relationships, terminology, exceptions, numbers/equations and grounded clinical/exam implications. Outline only; do not write lesson prose yet.`,
+      prompt: `Treat this indexed course section as curriculum and plan an adaptive exam-preparation lesson in ${language} for level ${pref.academic_level || pref.current_level || "beginner"}. Exam: ${pref.exam_format || pref.exam_style || "mixed"}; date: ${pref.exam_date || "unknown"}; confidence: ${pref.confidence || "medium"}. Build 4-10 high-yield concepts ordered by prerequisites and exam importance, each tied to exact CHUNK numbers. Include definitions, mechanisms, connections, traps, exact facts and likely exam demands. Outline only.`,
       source: {
         mimeType: "text/plain",
         name,
@@ -307,8 +321,12 @@ export async function POST(request: Request) {
         chunkIndexes: selected.length ? selected : fallback,
       };
     });
+    for (const stage of cleanStages) {
+      const concept = await sql`insert into public.course_concepts(user_id,document_id,section_id,concept_key,title,prerequisites_json,key_facts_json,common_mistakes_json,chunk_indexes_json,page_start,page_end,exam_importance,hierarchy_json,confidence,method,source_version) values(${userId},${item.document_id},${item.section_id},${stage.id},${stage.title},'[]'::jsonb,${JSON.stringify(stage.keyTerms)}::jsonb,'[]'::jsonb,${JSON.stringify(stage.chunkIndexes)}::jsonb,${item.page_start},${item.page_end},${Math.max(1,5-Math.floor(cleanStages.indexOf(stage)/2))},${JSON.stringify({section:item.section_title,position:cleanStages.indexOf(stage)})}::jsonb,.9,'professor_outline',${Number(item.index_version)}) on conflict(user_id,document_id,concept_key,source_version) do update set title=excluded.title,chunk_indexes_json=excluded.chunk_indexes_json,updated_at=now() returning id`;
+      stage.conceptId=String(concept[0].id);
+    }
     const inserted =
-      await sql`insert into public.professor_lessons(user_id,document_id,section_id,task_id,stages_json,mastery_questions_json,completed_stages_json,interactions_json,stage_checks_json,outline_version,provider,model,input_tokens,output_tokens) values(${userId},${item.document_id},${item.section_id},${item.id},${JSON.stringify({ title: value.title, objectives: value.objectives, conceptMap: value.conceptMap, stages: cleanStages, recap: value.recap })}::jsonb,${JSON.stringify(value.masteryQuestions)}::jsonb,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,2,${generated.provider},${generated.model},${generated.usage.input_tokens},${generated.usage.output_tokens}) on conflict(user_id,document_id,section_id) do nothing returning *`;
+      await sql`insert into public.professor_lessons(user_id,document_id,section_id,task_id,session_id,current_concept_id,phase,exam_mode,stages_json,mastery_questions_json,completed_stages_json,interactions_json,stage_checks_json,outline_version,provider,model,input_tokens,output_tokens) values(${userId},${item.document_id},${item.section_id},${item.id},${sessionId},${cleanStages[0]?.conceptId || null},'teach',${isNearExam(pref.exam_date)},${JSON.stringify({ title: value.title, objectives: value.objectives, conceptMap: value.conceptMap, stages: cleanStages, recap: value.recap })}::jsonb,${JSON.stringify(value.masteryQuestions)}::jsonb,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,3,${generated.provider},${generated.model},${generated.usage.input_tokens},${generated.usage.output_tokens}) on conflict(user_id,document_id,section_id) do nothing returning *`;
     let saved =
       inserted[0] ||
       (
@@ -321,6 +339,8 @@ export async function POST(request: Request) {
       pref,
       0,
     );
+    await sql`update public.professor_sessions set lesson_id=${saved.id},last_activity_at=now() where id=${sessionId} and user_id=${userId}`;
+    if(saved.current_concept_id) await sql`insert into public.student_concept_state(user_id,document_id,concept_id,state,last_seen_at) values(${userId},${item.document_id},${saved.current_concept_id},'learning',now()) on conflict(user_id,document_id,concept_id) do update set state='learning',last_seen_at=now(),updated_at=now()`;
     await sql`update public.study_plan_tasks set learning_status='learning_in_progress' where id=${item.id} and user_id=${userId}`;
     return NextResponse.json({ lesson: saved, section: item });
   } catch (error) {
@@ -351,36 +371,33 @@ export async function PATCH(request: Request) {
         ),
       ),
       stage = stages[stageIndex];
+    const advanceStage = async (forceSkip = false) => {
+      const completed = [...new Set([...(lesson.completed_stages_json || []), stageIndex])], next = nextLessonState(stageIndex, stages.length), nextConceptId=stages[next.currentStage]?.conceptId || null;
+      if(stage?.conceptId) await sql`insert into public.student_concept_state(user_id,document_id,concept_id,state,skipped,weak,force_skipped,last_seen_at) values(${userId},${lesson.document_id},${stage.conceptId},${forceSkip?'learning':'understood'},${forceSkip},${forceSkip},${forceSkip},now()) on conflict(user_id,document_id,concept_id) do update set state=excluded.state,skipped=excluded.skipped,weak=excluded.weak,force_skipped=excluded.force_skipped,last_seen_at=now(),updated_at=now()`;
+      lesson=(await sql`update public.professor_lessons set current_stage=${next.currentStage},lesson_position=${next.currentStage},current_concept_id=${nextConceptId},phase=${next.status==='learning'?'teach':'exam_test'},status=${next.status},completed_stages_json=${JSON.stringify(completed)}::jsonb,updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`)[0];
+      if(next.status==='learning') lesson=await generateStage(userId,{...lesson,original_name:context.lesson.original_name,source_version:context.lesson.source_version},chunks,pref,next.currentStage);
+      await sql`update public.study_plan_tasks set learning_status=${next.status === "doubt_clearing" ? "lesson_completed_mastery_pending" : "learning_in_progress"} where id=${lesson.task_id} and user_id=${userId}`;
+      await sql`update public.professor_sessions set last_activity_at=now() where id=${lesson.session_id} and user_id=${userId}`;
+      return lesson;
+    };
+    if (body.action === "skip") {
+      if(!stage?.conceptId) return NextResponse.json({error:"Concept unavailable"},{status:409});
+      await sql`insert into public.student_concept_state(user_id,document_id,concept_id,state,skipped,last_seen_at) values(${userId},${lesson.document_id},${stage.conceptId},'learning',true,now()) on conflict(user_id,document_id,concept_id) do update set skipped=true,last_seen_at=now(),updated_at=now()`;
+      return NextResponse.json({lesson,quickVerification:{question:stage.check,seconds:15}});
+    }
+    if (body.action === "force_skip") return NextResponse.json({lesson:await advanceStage(true),forceSkipped:true});
     if (body.action === "stage") {
-      if (
-        stage &&
-        !(lesson.stage_checks_json || []).some(
-          (check: any) => Number(check.stageIndex) === stageIndex,
-        )
-      )
+      const stageCheck=(lesson.stage_checks_json || []).find((check:any)=>Number(check.stageIndex)===stageIndex);
+      if (stage && !stageCheck)
         return NextResponse.json(
           { error: "Answer the comprehension check before continuing." },
           { status: 409 },
         );
-      const completed = [
-          ...new Set([...(lesson.completed_stages_json || []), stageIndex]),
-        ],
-        next = nextLessonState(stageIndex, stages.length);
-      lesson = (
-        await sql`update public.professor_lessons set current_stage=${next.currentStage},status=${next.status},completed_stages_json=${JSON.stringify(completed)}::jsonb,updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`
-      )[0];
-      if (next.status === "learning")
-        lesson = await generateStage(
-          userId,
-          { ...lesson, original_name: context.lesson.original_name },
-          chunks,
-          pref,
-          next.currentStage,
-        );
-      await sql`update public.study_plan_tasks set learning_status=${next.status === "doubt_clearing" ? "lesson_completed_mastery_pending" : "learning_in_progress"} where id=${lesson.task_id} and user_id=${userId}`;
-      return NextResponse.json({ lesson });
+      if(stageCheck?.verdict==='needs_review') return NextResponse.json({error:"Professor detected a gap. Try the new explanation and verify again before continuing.",reteach:true},{status:409});
+      return NextResponse.json({ lesson:await advanceStage(false) });
     }
-    if (isProfessorAction(body.action) && stage) {
+    const adaptiveAction = ({explain_differently:"simpler",test_me:"deeper",exam_appearance:"why"} as Record<string,string>)[body.action] || body.action;
+    if (isProfessorAction(adaptiveAction) && stage) {
       const relevant = chunksForStage(chunks, stage),
         name = String(context.lesson.original_name),
         recent = (lesson.interactions_json || [])
@@ -394,7 +411,7 @@ export async function PATCH(request: Request) {
         mode: "tutor",
         schema: expansionSchema,
         allowedCitations: professorCitations(name, relevant),
-        prompt: `${actionInstruction(body.action)} Respond in ${pref.teaching_language || pref.preferred_language || "it"} for level ${pref.academic_level || pref.current_level || "beginner"}. Stay scoped to section “${context.lesson.section_title}”, current concept “${stage.title}”, original evidence, and core teaching. Do not replace or repeat the core lesson. CORE: ${stage.content || ""}. RECENT EXPANSIONS: ${JSON.stringify(recent.map((x: any) => ({ action: x.action, content: x.content })))}.`,
+        prompt: `${body.action==='test_me'?'Ask one exam-style question without revealing its answer.':body.action==='exam_appearance'?'Show how this concept could appear on the configured exam, including one common trap.':actionInstruction(adaptiveAction as any)} Respond in ${pref.teaching_language || pref.preferred_language || "it"}. Keep this turn concise and change strategy when re-teaching. Concept “${stage.title}”. CORE: ${String(stage.content || "").slice(0,1600)}. RECENT: ${JSON.stringify(compactRecentTurns(recent))}.`,
         source: {
           mimeType: "text/plain",
           name,
@@ -459,8 +476,9 @@ export async function PATCH(request: Request) {
           ),
           check,
         ];
+      if(stage.conceptId){const passed=value.verdict!=="needs_review",outcome={question:stage.check,answer,verdict:value.verdict,at:new Date().toISOString()};await sql`insert into public.student_concept_state(user_id,document_id,concept_id,state,weak,misconceptions_json,recent_mistakes_json,verification_outcomes_json,last_seen_at) values(${userId},${lesson.document_id},${stage.conceptId},${passed?'understood':'learning'},${!passed},${JSON.stringify(passed?[]:[value.correction])}::jsonb,${JSON.stringify(passed?[]:[answer])}::jsonb,${JSON.stringify([outcome])}::jsonb,now()) on conflict(user_id,document_id,concept_id) do update set state=excluded.state,weak=excluded.weak,misconceptions_json=case when excluded.weak then public.student_concept_state.misconceptions_json||excluded.misconceptions_json else public.student_concept_state.misconceptions_json end,recent_mistakes_json=case when excluded.weak then public.student_concept_state.recent_mistakes_json||excluded.recent_mistakes_json else public.student_concept_state.recent_mistakes_json end,verification_outcomes_json=public.student_concept_state.verification_outcomes_json||excluded.verification_outcomes_json,last_seen_at=now(),updated_at=now()`;}
       lesson = (
-        await sql`update public.professor_lessons set stage_checks_json=${JSON.stringify(checks)}::jsonb,provider=${generated.provider},model=${generated.model},input_tokens=input_tokens+${generated.usage.input_tokens},output_tokens=output_tokens+${generated.usage.output_tokens},updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`
+        await sql`update public.professor_lessons set stage_checks_json=${JSON.stringify(checks)}::jsonb,phase=${value.verdict==='needs_review'?'reteach':'connect'},recent_turns_json=${JSON.stringify(compactRecentTurns([...(lesson.recent_turns_json||[]),{role:'student',phase:'verify',text:answer},{role:'professor',phase:value.verdict==='needs_review'?'reteach':'connect',text:value.feedback}]))}::jsonb,provider=${generated.provider},model=${generated.model},input_tokens=input_tokens+${generated.usage.input_tokens},output_tokens=output_tokens+${generated.usage.output_tokens},updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`
       )[0];
       return NextResponse.json({ lesson, check });
     }
@@ -544,12 +562,15 @@ export async function PATCH(request: Request) {
       });
       const result = assessment.result as any,
         score = Math.max(0, Math.min(100, Number(result.score) || 0)),
-        status = score >= 70 ? "mastered" : "needs_review";
+        conceptState=learningStateForScore(score,true),
+        status = score >= 75 ? "mastered" : "needs_review";
       await sql`update public.professor_lessons set mastery_score=${score},status=${status},provider=${assessment.provider},model=${assessment.model},input_tokens=input_tokens+${assessment.usage.input_tokens},output_tokens=output_tokens+${assessment.usage.output_tokens},updated_at=now() where id=${lesson.id} and user_id=${userId}`;
       await sql`update public.study_plan_tasks set learning_status=${status},status=${status === "mastered" ? "completed" : "planned"},score=${score},completed_at=${status === "mastered" ? new Date().toISOString() : null} where id=${lesson.task_id} and user_id=${userId}`;
       await sql`insert into public.section_mastery(user_id,document_id,section_id,questions_answered,question_accuracy,confidence,updated_at) values(${userId},${lesson.document_id},${lesson.section_id},${questions.length},${score},${score},now()) on conflict(user_id,document_id,section_id) do update set questions_answered=excluded.questions_answered,question_accuracy=excluded.question_accuracy,confidence=excluded.confidence,updated_at=now()`;
       for (const weak of result.weakConcepts || [])
         await sql`insert into public.weak_concepts(user_id,document_id,section_id,concept,evidence) values(${userId},${lesson.document_id},${lesson.section_id},${String(weak.concept)},${String(weak.evidence)})`;
+      await sql`update public.student_concept_state set state=${conceptState},weak=${score<75},mastery_score=${score},updated_at=now() where user_id=${userId} and document_id=${lesson.document_id} and concept_id in(select id from public.course_concepts where section_id=${lesson.section_id} and user_id=${userId})`;
+      await sql`update public.professor_sessions set status=${status==='mastered'?'completed':'needs_review'},last_activity_at=now(),ended_at=${status==='mastered'?new Date().toISOString():null} where id=${lesson.session_id} and user_id=${userId}`;
       return NextResponse.json({
         score,
         status,
