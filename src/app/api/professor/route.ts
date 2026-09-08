@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { createHash } from "node:crypto";
-import { configuredAiProvider, publicAiError } from "@/lib-ai";
+import { publicAiError } from "@/lib-ai";
 import { professorProvider } from "@/lib-professor-provider";
+import { chooseProfessorTier } from "@/lib-professor-routing";
 import type { StoredChunk } from "@/lib-document-processing";
 import {
   actionInstruction,
@@ -209,7 +210,8 @@ async function generateStage(
     stages[stageIndex] = { ...stage, ...cached[0].content_json, cached: true };
     return (await db()`update public.professor_lessons set stages_json=${JSON.stringify({ ...data, stages })}::jsonb,phase='verify',updated_at=now() where id=${lesson.id} and user_id=${userId} returning *`)[0];
   }
-  const generated = await (await professorProvider({ userId, documentId: String(lesson.document_id), sessionId: String(lesson.session_id), requestId: `professor-stage:${lesson.id}:${stage.id}:${lesson.outline_version}` })).generate({
+  const tier=chooseProfessorTier({kind:"teaching",concept:`${stage.title} ${stage.purpose}`,repeatedMisunderstandings:(lesson.stage_checks_json||[]).filter((x:any)=>Number(x.stageIndex)===stageIndex&&x.verdict==="needs_review").length});
+  const generated = await (await professorProvider({ userId, documentId: String(lesson.document_id), sessionId: String(lesson.session_id), requestId: `professor-stage:${lesson.id}:${stage.id}:${lesson.outline_version}`,tier })).generate({
     mode: "tutor",
     schema: teachingSchema,
     allowedCitations: professorCitations(name, chunks),
@@ -292,7 +294,7 @@ export async function POST(request: Request) {
     const name = String(item.original_name);
     const session = await sql`insert into public.professor_sessions(user_id,document_id) values(${userId},${item.document_id}) returning id`;
     const sessionId=String(session[0].id);
-    const generated = await (await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}` })).generate({
+    const generated = await (await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}`,tier:"economy" })).generate({
       mode: "tutor",
       schema: outlineSchema,
       allowedCitations: professorCitations(name, chunks),
@@ -403,11 +405,8 @@ export async function PATCH(request: Request) {
         recent = (lesson.interactions_json || [])
           .filter((x: any) => Number(x.stageIndex) === stageIndex)
           .slice(-4);
-      const generated = await configuredAiProvider("professor", {
-        userId,
-        documentId: String(lesson.document_id),
-        protectedContext: true,
-      }).generate({
+      const expansionTier=chooseProfessorTier({kind:"teaching",concept:`${stage.title} ${stage.purpose}`,repeatedMisunderstandings:recent.filter((x:any)=>x.action==="explain_differently").length,forceAdvanced:body.action==="deeper"});
+      const generated = await (await professorProvider({userId,documentId:String(lesson.document_id),sessionId:String(lesson.session_id),requestId:`professor-expansion:${lesson.id}:${stageIndex}:${String(body.action)}:${lesson.interactions_json?.length||0}`,tier:expansionTier})).generate({
         mode: "tutor",
         schema: expansionSchema,
         allowedCitations: professorCitations(name, relevant),
@@ -444,11 +443,7 @@ export async function PATCH(request: Request) {
         );
       const relevant = chunksForStage(chunks, stage),
         name = String(context.lesson.original_name),
-        generated = await configuredAiProvider("error_correction", {
-          userId,
-          documentId: String(lesson.document_id),
-          protectedContext: true,
-        }).generate({
+        generated = await (await professorProvider({userId,documentId:String(lesson.document_id),sessionId:String(lesson.session_id),requestId:`professor-verify:${lesson.id}:${stageIndex}:${lesson.stage_checks_json?.length||0}`,tier:chooseProfessorTier({kind:"classification",concept:stage.title,repeatedMisunderstandings:(lesson.stage_checks_json||[]).filter((x:any)=>x.verdict==="needs_review").length})})).generate({
           mode: "tutor",
           schema: feedbackSchema,
           allowedCitations: professorCitations(name, relevant),
@@ -490,11 +485,7 @@ export async function PATCH(request: Request) {
           { status: 400 },
         );
       const name = String(context.lesson.original_name);
-      const generated = await configuredAiProvider("professor", {
-        userId,
-        documentId: String(lesson.document_id),
-        protectedContext: true,
-      }).generate({
+      const generated = await (await professorProvider({userId,documentId:String(lesson.document_id),sessionId:String(lesson.session_id),requestId:`professor-doubt:${lesson.id}:${lesson.doubts_json?.length||0}`,tier:chooseProfessorTier({kind:"teaching",concept:question,repeatedMisunderstandings:(lesson.doubts_json||[]).length})})).generate({
         mode: "tutor",
         schema: expansionSchema,
         allowedCitations: professorCitations(name, chunks),
@@ -526,11 +517,7 @@ export async function PATCH(request: Request) {
         questions = Array.isArray(lesson.mastery_questions_json)
           ? lesson.mastery_questions_json
           : [];
-      const assessment = await configuredAiProvider("error_correction", {
-        userId,
-        documentId: String(lesson.document_id),
-        protectedContext: true,
-      }).generate({
+      const assessment = await (await professorProvider({userId,documentId:String(lesson.document_id),sessionId:String(lesson.session_id),requestId:`professor-mastery:${lesson.id}:${lesson.mastery_score===null?0:1}`,tier:chooseProfessorTier({kind:"exam",concept:questions.map((x:any)=>x.concept).join(" "),repeatedMisunderstandings:(lesson.stage_checks_json||[]).filter((x:any)=>x.verdict==="needs_review").length})})).generate({
         mode: "tutor",
         prompt: `Grade these active-recall answers against expected answers. Return score 0-100 and weakConcepts. Questions: ${JSON.stringify(questions)} Answers: ${JSON.stringify(answers)}`,
         schema: {
