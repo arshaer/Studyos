@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AiProviderError, compressionPolicyFor, configuredAiProvider, createAIGateway, parseStructuredOutput, publicAiError, resetProviderHealthForTests, retryDelayMs, streamAI, StructuredOutputError, type AiProvider } from "../src/lib-ai.ts";
+import { AiProviderError, compressionPolicyFor, configuredAiProvider, createAIGateway, OpenRouterProvider, parseStructuredOutput, publicAiError, resetProviderHealthForTests, retryDelayMs, streamAI, StructuredOutputError, type AiProvider } from "../src/lib-ai.ts";
 
 const tutorSchema = {
   type: "object",
@@ -319,5 +319,32 @@ test("OmniRoute genuine credential 401 remains an auth failure", async () => {
     delete process.env.OMNIROUTE_API_KEY;
     delete process.env.GEMINI_API_KEY;
     delete process.env.AI_MAX_RETRIES;
+  }
+});
+
+test("OpenRouter Professor sends only the approved model/provider pool with strict privacy", async () => {
+  process.env.OPENROUTER_ENABLED = "true";
+  process.env.OPENROUTER_API_KEY = "test-only";
+  const originalFetch = globalThis.fetch;
+  let body: any;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ model: "vendor/cheap", provider: "Vendor A", choices: [{ message: { content: JSON.stringify({ title: "Answer", content: "Grounded", citations: [], followUps: [] }) } }], usage: { prompt_tokens: 20, completion_tokens: 8, cost: 0.001, prompt_tokens_details: { cached_tokens: 10 }, completion_tokens_details: { reasoning_tokens: 2 } } }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const provider = new OpenRouterProvider({ models: ["vendor/cheap", "vendor/cheap-fallback"], underlyingProviders: ["vendor-a"], deniedProviders: ["vendor-b"], allowFallbacks: true, requireZdr: true, routingPreference: "price", sessionId: "session-1" });
+    const result = await provider.generate({ ...gatewayRequest, maxOutputTokens: 300 });
+    assert.deepEqual(body.models, ["vendor/cheap-fallback"]);
+    assert.deepEqual(body.provider.only, ["vendor-a"]);
+    assert.deepEqual(body.provider.ignore, ["vendor-b"]);
+    assert.equal(body.provider.data_collection, "deny");
+    assert.equal(body.provider.zdr, true);
+    assert.equal(body.max_tokens, 300);
+    assert.equal(result.usage.cached_input_tokens, 10);
+    assert.equal(result.usage.actual_cost_usd, 0.001);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OPENROUTER_ENABLED;
+    delete process.env.OPENROUTER_API_KEY;
   }
 });

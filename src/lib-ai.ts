@@ -20,10 +20,11 @@ export type AiGenerationRequest = {
 };
 
 export type AiGenerationResult = {
-  provider: "omniroute" | "gemini" | "openai";
+  provider: "omniroute" | "gemini" | "openai" | "openrouter";
   model: string;
+  underlyingProvider?: string;
   result: Record<string, unknown>;
-  usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number; reasoning_tokens?: number; other_billable_tokens?: number };
+  usage: { input_tokens: number; output_tokens: number; cached_input_tokens?: number; reasoning_tokens?: number; other_billable_tokens?: number; actual_cost_usd?: number };
   gateway?: "studyos";
   fallbackCount?: number;
   compression?: { policy: CompressionPolicy; ratio?: number };
@@ -50,7 +51,7 @@ export class AiProviderError extends Error {
 
 export type AITelemetry = {
   userId?: string; documentId?: string; requestId?: string; sessionId?: string; requestedTier?: string; task: AITask; gateway: "studyos";
-  provider: string; model: string; inputTokens: number; outputTokens: number;
+  provider: string; underlyingProvider?: string; model: string; inputTokens: number; outputTokens: number;
   cachedInputTokens: number; reasoningTokens: number; otherBillableTokens: number;
   estimatedCost: number | null; costStatus: "known" | "free" | "unknown";
   latencyMs: number; fallbackCount: number; compressionEnabled: boolean;
@@ -70,10 +71,10 @@ async function persistDefaultTelemetry(row: AITelemetry) {
   const { db } = await import("./lib-db");
   const sql = db();
   const pricing = await sql`select * from public.ai_model_pricing where provider=${row.provider} and model=${row.model} and active=true order by updated_at desc limit 1`;
-  const price=pricing[0], estimated=price ? (row.inputTokens*Number(price.input_per_million_usd)+row.cachedInputTokens*Number(price.cached_input_per_million_usd)+row.outputTokens*Number(price.output_per_million_usd)+row.reasoningTokens*Number(price.reasoning_per_million_usd))/1_000_000 : row.provider==="gemini" ? 0 : row.estimatedCost;
+  const price=pricing[0], estimated=row.estimatedCost ?? (price ? (row.inputTokens*Number(price.input_per_million_usd)+row.cachedInputTokens*Number(price.cached_input_per_million_usd)+row.outputTokens*Number(price.output_per_million_usd)+row.reasoningTokens*Number(price.reasoning_per_million_usd))/1_000_000 : row.provider==="gemini" ? 0 : null);
   const costStatus=price ? "known" : row.provider==="gemini" ? "free" : row.costStatus;
   await sql`insert into public.ai_requests(user_id,document_id,task_type,feature,gateway,provider,underlying_provider,model,request_id,session_id,requested_tier,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,other_billable_tokens,estimated_cost,cost_status,latency_ms,fallback_count,retry_count,fallback_used,throttled,compression_enabled,compression_policy,compression_ratio,success,error_type)
-    values(${row.userId},${row.documentId || null},${row.task},${row.task},${row.gateway},${row.provider},${row.provider},${row.model},${row.requestId || null},${row.sessionId || null},${row.requestedTier || null},${row.inputTokens},${row.cachedInputTokens},${row.outputTokens},${row.reasoningTokens},${row.otherBillableTokens},${estimated},${costStatus},${row.latencyMs},${row.fallbackCount},${row.retryCount},${row.fallbackCount > 0},${row.errorType === "rate_limit"},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType}) on conflict(request_id) where request_id is not null do nothing`;
+    values(${row.userId},${row.documentId || null},${row.task},${row.task},${row.gateway},${row.provider},${row.underlyingProvider || row.provider},${row.model},${row.requestId || null},${row.sessionId || null},${row.requestedTier || null},${row.inputTokens},${row.cachedInputTokens},${row.outputTokens},${row.reasoningTokens},${row.otherBillableTokens},${estimated},${costStatus},${row.latencyMs},${row.fallbackCount},${row.retryCount},${row.fallbackCount > 0},${row.errorType === "rate_limit"},${row.compressionEnabled},${row.compressionPolicy},${row.compressionRatio},${row.success},${row.errorType}) on conflict(request_id) where request_id is not null do nothing`;
 }
 
 const QUALITY_BY_TASK: Record<AITask, AIQuality> = {
@@ -512,6 +513,48 @@ export function configuredPaidProfessorProvider(metadata: { userId: string; docu
   return scopedProvider("professor",metadata,[new OpenAiProvider(),...free]);
 }
 
+export type OpenRouterRoute = { models: string[]; underlyingProviders: string[]; deniedProviders: string[]; allowFallbacks: boolean; requireZdr: boolean; routingPreference: "price" | "latency" | "throughput"; sessionId: string };
+
+export class OpenRouterProvider implements AiProvider {
+  readonly name = "openrouter" as const;
+  readonly model: string;
+  private readonly route: OpenRouterRoute;
+  constructor(route: OpenRouterRoute) { this.route = route; this.model = route.models[0] || ""; }
+  async generate(request: AiGenerationRequest): Promise<AiGenerationResult> {
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+    if (!apiKey || process.env.OPENROUTER_ENABLED !== "true") throw new AiProviderError("auth", "OpenRouter is not enabled", { provider: this.name });
+    if (!this.model || !this.route.underlyingProviders.length) throw new AiProviderError("auth", "OpenRouter requires an approved model and provider pool", { provider: this.name });
+    if (request.source.text === undefined) throw new AiProviderError("unknown", "Professor must send indexed text chunks, not whole files", { provider: this.name });
+    const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "http-referer": process.env.NEXT_PUBLIC_APP_URL?.trim() || "https://studyos-beryl.vercel.app", "x-title": "StudyOS Professor" },
+      body: JSON.stringify({
+        model: this.model, models: this.route.models.slice(1), session_id: this.route.sessionId,
+        messages: [
+          { role: "system", content: SYSTEM_INSTRUCTION },
+          { role: "user", content: `COURSE CONTEXT — ${request.source.name}\n${request.source.text}` },
+          { role: "user", content: `${taskFor(request.mode, request.prompt)}\n\n${strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}` },
+        ],
+        response_format: { type: "json_schema", json_schema: { name: "studyos_professor", strict: true, schema: effectiveSchema } },
+        max_tokens: request.maxOutputTokens || 650,
+        provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference },
+      }), signal: AbortSignal.timeout(55_000),
+    });
+    const payload = await response.json() as Record<string, any>;
+    if (!response.ok) throw providerError(this.name, response, payload);
+    const text = payload.choices?.[0]?.message?.content;
+    if (typeof text !== "string") throw new StructuredOutputError("OpenRouter returned no structured Professor output");
+    const usage = payload.usage || {};
+    const actualModel=String(payload.model || this.model);
+    return { provider: this.name, underlyingProvider: String(payload.provider || "unknown"), model: actualModel, fallbackCount: actualModel===this.model?0:1, result: parseStructuredOutput(text, effectiveSchema), usage: { input_tokens: Number(usage.prompt_tokens || 0), cached_input_tokens: Number(usage.prompt_tokens_details?.cached_tokens || 0), output_tokens: Number(usage.completion_tokens || 0), reasoning_tokens: Number(usage.completion_tokens_details?.reasoning_tokens || 0), actual_cost_usd: Number.isFinite(Number(usage.cost)) ? Number(usage.cost) : undefined } };
+  }
+}
+
+export function configuredOpenRouterProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string; requestedTier?: string }, route: OpenRouterRoute) {
+  return scopedProvider("professor",metadata,[new OpenRouterProvider(route)]);
+}
+
 const health = new Map<string, { failures: number; unhealthyUntil: number }>();
 const PRICE_PER_MILLION: Record<string, { input: number; output: number; status: "known" | "free" }> = {};
 
@@ -555,10 +598,11 @@ export function createAIGateway(options: GatewayOptions = {}) {
         try {
           const result = await provider.generate(request);
           health.delete(provider.name);
-          const cost = estimateCost(result.model, result.usage);
-          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: result.provider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
+          const cost = result.usage.actual_cost_usd === undefined ? estimateCost(result.model, result.usage) : { estimatedCost: result.usage.actual_cost_usd, costStatus: "known" as const };
+          const effectiveFallbackCount=fallbackCount+(result.fallbackCount||0);
+          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: result.provider, underlyingProvider: result.underlyingProvider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount:effectiveFallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
           try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
-          return { ...result, gateway: "studyos", fallbackCount, compression: { policy: compression } };
+          return { ...result, gateway: "studyos", fallbackCount:effectiveFallbackCount, compression: { policy: compression } };
         } catch (error) {
           lastError = normalizeProviderError(provider.name, error);
           if (!transientKinds.has(lastError.kind) || attempt === maxRetries) break;
