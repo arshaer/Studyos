@@ -340,6 +340,7 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
     assert.equal(body.provider.data_collection, "deny");
     assert.equal(body.provider.zdr, true);
     assert.equal(body.provider.max_price.request, 0.02);
+    assert.deepEqual(body.plugins, [{ id: "response-healing" }]);
     assert.equal(body.max_tokens, 300);
     assert.equal(result.usage.cached_input_tokens, 10);
     assert.equal(result.usage.actual_cost_usd, 0.001);
@@ -347,5 +348,34 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
     globalThis.fetch = originalFetch;
     delete process.env.OPENROUTER_ENABLED;
     delete process.env.OPENROUTER_API_KEY;
+  }
+});
+
+test("OpenRouter malformed retries retain their billable usage in telemetry", async () => {
+  process.env.OPENROUTER_ENABLED = "true";
+  process.env.OPENROUTER_API_KEY = "test-only";
+  process.env.AI_MAX_RETRIES = "1";
+  const originalFetch = globalThis.fetch;
+  const rows: any[] = [];
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    model: "vendor/cheap",
+    provider: "Vendor A",
+    choices: [{ message: { content: "{}" } }],
+    usage: { prompt_tokens: 20, completion_tokens: 8, cost: 0.002, prompt_tokens_details: { cached_tokens: 5 } },
+  }), { status: 200 })) as typeof fetch;
+  try {
+    const provider = new OpenRouterProvider({ models: ["vendor/cheap"], underlyingProviders: ["vendor-a"], deniedProviders: [], allowFallbacks: false, requireZdr: true, routingPreference: "price", maxCostPerRequestUsd: 0.02, sessionId: "session-1" });
+    await assert.rejects(createAIGateway({ providers: [provider], persistTelemetry: async row => { rows.push(row); } })({ ...gatewayRequest, task: "professor", requestId: "billed-failure" }), (error: unknown) => error instanceof AiProviderError && error.kind === "structured_output");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].inputTokens, 40);
+    assert.equal(rows[0].cachedInputTokens, 10);
+    assert.equal(rows[0].outputTokens, 16);
+    assert.equal(rows[0].estimatedCost, 0.004);
+    assert.equal(rows[0].costStatus, "known");
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OPENROUTER_ENABLED;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.AI_MAX_RETRIES;
   }
 });

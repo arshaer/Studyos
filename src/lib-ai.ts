@@ -40,8 +40,8 @@ export type AiErrorKind = "rate_limit" | "unavailable" | "timeout" | "auth" | "s
 
 export class AiProviderError extends Error {
   readonly kind: AiErrorKind;
-  readonly options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown };
-  constructor(kind: AiErrorKind, message: string, options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown }) {
+  readonly options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown; model?: string; underlyingProvider?: string; usage?: AiGenerationResult["usage"] };
+  constructor(kind: AiErrorKind, message: string, options: { provider: AiGenerationResult["provider"]; status?: number; retryAfterMs?: number; cause?: unknown; model?: string; underlyingProvider?: string; usage?: AiGenerationResult["usage"] }) {
     super(message, { cause: options.cause });
     this.name = "AiProviderError";
     this.kind = kind;
@@ -537,6 +537,7 @@ export class OpenRouterProvider implements AiProvider {
           { role: "user", content: `${taskFor(request.mode, request.prompt)}\n\n${strictJsonInstruction(effectiveSchema, request.allowedCitations || [])}` },
         ],
         response_format: { type: "json_schema", json_schema: { name: "studyos_professor", strict: true, schema: effectiveSchema } },
+        plugins: [{ id: "response-healing" }],
         max_tokens: request.maxOutputTokens || 650,
         provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference, ...(this.route.maxCostPerRequestUsd>0?{max_price:{request:this.route.maxCostPerRequestUsd}}:{}) },
       }), signal: AbortSignal.timeout(55_000),
@@ -544,10 +545,15 @@ export class OpenRouterProvider implements AiProvider {
     const payload = await response.json() as Record<string, any>;
     if (!response.ok) throw providerError(this.name, response, payload);
     const text = payload.choices?.[0]?.message?.content;
-    if (typeof text !== "string") throw new StructuredOutputError("OpenRouter returned no structured Professor output");
     const usage = payload.usage || {};
     const actualModel=String(payload.model || this.model);
-    return { provider: this.name, underlyingProvider: String(payload.provider || "unknown"), model: actualModel, fallbackCount: actualModel===this.model?0:1, result: parseStructuredOutput(text, effectiveSchema), usage: { input_tokens: Number(usage.prompt_tokens || 0), cached_input_tokens: Number(usage.prompt_tokens_details?.cached_tokens || 0), output_tokens: Number(usage.completion_tokens || 0), reasoning_tokens: Number(usage.completion_tokens_details?.reasoning_tokens || 0), actual_cost_usd: Number.isFinite(Number(usage.cost)) ? Number(usage.cost) : undefined } };
+    const actualUsage = { input_tokens: Number(usage.prompt_tokens || 0), cached_input_tokens: Number(usage.prompt_tokens_details?.cached_tokens || 0), output_tokens: Number(usage.completion_tokens || 0), reasoning_tokens: Number(usage.completion_tokens_details?.reasoning_tokens || 0), actual_cost_usd: Number.isFinite(Number(usage.cost)) ? Number(usage.cost) : undefined };
+    try {
+      if (typeof text !== "string") throw new StructuredOutputError("OpenRouter returned no structured Professor output");
+      return { provider: this.name, underlyingProvider: String(payload.provider || "unknown"), model: actualModel, fallbackCount: actualModel===this.model?0:1, result: parseStructuredOutput(text, effectiveSchema), usage: actualUsage };
+    } catch (error) {
+      throw new AiProviderError("structured_output", error instanceof Error ? error.message : "OpenRouter returned invalid structured output", { provider: this.name, cause: error, model: actualModel, underlyingProvider: String(payload.provider || "unknown"), usage: actualUsage });
+    }
   }
 }
 
@@ -590,6 +596,7 @@ export function createAIGateway(options: GatewayOptions = {}) {
     let retryCount = 0;
     let lastError: AiProviderError | undefined;
     let lastProvider = providers[0];
+    const failedUsage = { input: 0, cached: 0, output: 0, reasoning: 0, other: 0, cost: 0, costKnown: false };
     for (let providerIndex = 0; providerIndex < providers.length; providerIndex += 1) {
       const provider = providers[providerIndex]; lastProvider = provider;
       const state = health.get(provider.name);
@@ -598,13 +605,25 @@ export function createAIGateway(options: GatewayOptions = {}) {
         try {
           const result = await provider.generate(request);
           health.delete(provider.name);
-          const cost = result.usage.actual_cost_usd === undefined ? estimateCost(result.model, result.usage) : { estimatedCost: result.usage.actual_cost_usd, costStatus: "known" as const };
+          const currentCost = result.usage.actual_cost_usd === undefined ? estimateCost(result.model, result.usage) : { estimatedCost: result.usage.actual_cost_usd, costStatus: "known" as const };
+          const cost = failedUsage.costKnown
+            ? { estimatedCost: failedUsage.cost + Number(currentCost.estimatedCost || 0), costStatus: "known" as const }
+            : currentCost;
           const effectiveFallbackCount=fallbackCount+(result.fallbackCount||0);
-          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: result.provider, underlyingProvider: result.underlyingProvider, model: result.model, inputTokens: result.usage.input_tokens, cachedInputTokens: result.usage.cached_input_tokens || 0, outputTokens: result.usage.output_tokens, reasoningTokens: result.usage.reasoning_tokens || 0, otherBillableTokens: result.usage.other_billable_tokens || 0, ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount:effectiveFallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
+          const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: result.provider, underlyingProvider: result.underlyingProvider, model: result.model, inputTokens: failedUsage.input + result.usage.input_tokens, cachedInputTokens: failedUsage.cached + (result.usage.cached_input_tokens || 0), outputTokens: failedUsage.output + result.usage.output_tokens, reasoningTokens: failedUsage.reasoning + (result.usage.reasoning_tokens || 0), otherBillableTokens: failedUsage.other + (result.usage.other_billable_tokens || 0), ...cost, latencyMs: (options.now || Date.now)() - started, fallbackCount:effectiveFallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: true, errorType: null };
           try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
           return { ...result, gateway: "studyos", fallbackCount:effectiveFallbackCount, compression: { policy: compression } };
         } catch (error) {
           lastError = normalizeProviderError(provider.name, error);
+          const billed = lastError.options.usage;
+          if (billed) {
+            failedUsage.input += billed.input_tokens;
+            failedUsage.cached += billed.cached_input_tokens || 0;
+            failedUsage.output += billed.output_tokens;
+            failedUsage.reasoning += billed.reasoning_tokens || 0;
+            failedUsage.other += billed.other_billable_tokens || 0;
+            if (billed.actual_cost_usd !== undefined) { failedUsage.cost += billed.actual_cost_usd; failedUsage.costKnown = true; }
+          }
           if (!transientKinds.has(lastError.kind) || attempt === maxRetries) break;
           retryCount += 1;
           const base = Math.min(lastError.options.retryAfterMs ?? 1_000 * 2 ** attempt, 8_000);
@@ -617,7 +636,7 @@ export function createAIGateway(options: GatewayOptions = {}) {
       fallbackCount += 1;
     }
     const failure = lastError || new AiProviderError("unavailable", "All configured AI routes are unavailable", { provider: lastProvider.name });
-    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: lastProvider.name, model: lastProvider.model, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, otherBillableTokens: 0, estimatedCost: null, costStatus: "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
+    const row: AITelemetry = { userId: request.userId, documentId: request.documentId, requestId: request.requestId, sessionId: request.sessionId, requestedTier: request.requestedTier, task: request.task, gateway: "studyos", provider: lastProvider.name, underlyingProvider: failure.options.underlyingProvider, model: failure.options.model || lastProvider.model, inputTokens: failedUsage.input, cachedInputTokens: failedUsage.cached, outputTokens: failedUsage.output, reasoningTokens: failedUsage.reasoning, otherBillableTokens: failedUsage.other, estimatedCost: failedUsage.costKnown ? failedUsage.cost : null, costStatus: failedUsage.costKnown ? "known" : "unknown", latencyMs: (options.now || Date.now)() - started, fallbackCount, retryCount, compressionEnabled: compression !== "off", compressionPolicy: compression, compressionRatio: null, success: false, errorType: failure.kind };
     try { await (options.persistTelemetry || persistDefaultTelemetry)(row); } catch (error) { console.warn("AI telemetry persistence failed", error); }
     throw failure;
   };
