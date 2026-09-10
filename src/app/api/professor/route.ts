@@ -154,8 +154,9 @@ async function generateStage(
     stages = Array.isArray(data.stages)
       ? ([...data.stages] as ProfessorStage[])
       : [],
-    stage = stages[stageIndex];
-  if (!stage || stage.content) return lesson;
+    initialStage = stages[stageIndex];
+  if (!initialStage) return lesson;
+  let stage = initialStage;
   const chunks = chunksForStage(allChunks, stage).slice(0, 6),
     name = String(lesson.original_name || "source"),
     recent = stages
@@ -164,7 +165,25 @@ async function generateStage(
         title: item.title,
         content: item.content?.slice(-1800),
       }));
-  const cacheKey = createHash("sha256").update(JSON.stringify({ documentId: lesson.document_id, version: lesson.source_version || 1, concept: stage.id, language: pref.teaching_language || pref.preferred_language || "it", depth: pref.explanation_depth || "adaptive" })).digest("hex");
+  if (stage.content) {
+    const allowed = new Set(professorCitations(name, chunks));
+    const citations = Array.isArray(stage.citations) ? stage.citations : [];
+    if (!stage.cached || (citations.length > 0 && citations.every((citation) => allowed.has(String(citation))))) return lesson;
+    const { content: _content, check: _check, citations: _citations, cached: _cached, generatedAt: _generatedAt, ...cleanStage } = stage as any;
+    stage = cleanStage as ProfessorStage;
+    stages[stageIndex] = stage;
+  }
+  const cacheKey = createHash("sha256").update(JSON.stringify({
+    documentId: lesson.document_id,
+    sectionId: lesson.section_id,
+    version: lesson.source_version || 1,
+    outlineVersion: lesson.outline_version || 1,
+    conceptId: stage.id,
+    conceptTitle: stage.title,
+    chunkIndexes: stage.chunkIndexes,
+    language: pref.teaching_language || pref.preferred_language || "it",
+    depth: pref.explanation_depth || "adaptive",
+  })).digest("hex");
   const cached = await db()`select content_json from public.professor_content_cache where cache_key=${cacheKey} and user_id=${userId} limit 1`;
   if (cached[0]) {
     stages[stageIndex] = { ...stage, ...cached[0].content_json, cached: true };
