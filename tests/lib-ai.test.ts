@@ -341,6 +341,7 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
     assert.equal(body.provider.zdr, true);
     assert.equal(body.provider.max_price.request, 0.02);
     assert.deepEqual(body.plugins, [{ id: "response-healing" }]);
+    assert.deepEqual(body.usage, { include: true });
     assert.equal(body.max_tokens, 300);
     assert.equal(result.usage.cached_input_tokens, 10);
     assert.equal(result.usage.actual_cost_usd, 0.001);

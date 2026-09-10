@@ -538,6 +538,7 @@ export class OpenRouterProvider implements AiProvider {
         ],
         response_format: { type: "json_schema", json_schema: { name: "studyos_professor", strict: true, schema: effectiveSchema } },
         plugins: [{ id: "response-healing" }],
+        usage: { include: true },
         max_tokens: request.maxOutputTokens || 650,
         provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference, ...(this.route.maxCostPerRequestUsd>0?{max_price:{request:this.route.maxCostPerRequestUsd}}:{}) },
       }), signal: AbortSignal.timeout(55_000),
