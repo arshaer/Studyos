@@ -26,18 +26,6 @@ const outlineSchema = {
   type: "object",
   properties: {
     title: { type: "string" },
-    objectives: {
-      type: "array",
-      minItems: 4,
-      maxItems: 10,
-      items: { type: "string" },
-    },
-    conceptMap: {
-      type: "array",
-      minItems: 4,
-      maxItems: 12,
-      items: { type: "string" },
-    },
     stages: {
       type: "array",
       minItems: 4,
@@ -65,36 +53,8 @@ const outlineSchema = {
         additionalProperties: false,
       },
     },
-    recap: {
-      type: "array",
-      minItems: 4,
-      maxItems: 12,
-      items: { type: "string" },
-    },
-    masteryQuestions: {
-      type: "array",
-      minItems: 4,
-      maxItems: 8,
-      items: {
-        type: "object",
-        properties: {
-          question: { type: "string" },
-          expected: { type: "string" },
-          concept: { type: "string" },
-        },
-        required: ["question", "expected", "concept"],
-        additionalProperties: false,
-      },
-    },
   },
-  required: [
-    "title",
-    "objectives",
-    "conceptMap",
-    "stages",
-    "recap",
-    "masteryQuestions",
-  ],
+  required: ["title", "stages"],
   additionalProperties: false,
 };
 const teachingSchema = {
@@ -323,12 +283,20 @@ export async function POST(request: Request) {
         chunkIndexes: selected.length ? selected : fallback,
       };
     });
+    const objectives = cleanStages.map((stage: any) => stage.purpose);
+    const conceptMap = cleanStages.map((stage: any) => stage.title);
+    const recap = cleanStages.map((stage: any) => `${stage.title}: ${stage.purpose}`);
+    const masteryQuestions = cleanStages.map((stage: any) => ({
+      question: `Spiega ${stage.title} e collegalo agli altri concetti della sezione.`,
+      expected: stage.purpose,
+      concept: stage.title,
+    }));
     for (const stage of cleanStages) {
       const concept = await sql`insert into public.course_concepts(user_id,document_id,section_id,concept_key,title,prerequisites_json,key_facts_json,common_mistakes_json,chunk_indexes_json,page_start,page_end,exam_importance,hierarchy_json,confidence,method,source_version) values(${userId},${item.document_id},${item.section_id},${stage.id},${stage.title},'[]'::jsonb,${JSON.stringify(stage.keyTerms)}::jsonb,'[]'::jsonb,${JSON.stringify(stage.chunkIndexes)}::jsonb,${item.page_start},${item.page_end},${Math.max(1,5-Math.floor(cleanStages.indexOf(stage)/2))},${JSON.stringify({section:item.section_title,position:cleanStages.indexOf(stage)})}::jsonb,.9,'professor_outline',${Number(item.index_version)}) on conflict(user_id,document_id,concept_key,source_version) do update set title=excluded.title,chunk_indexes_json=excluded.chunk_indexes_json,updated_at=now() returning id`;
       stage.conceptId=String(concept[0].id);
     }
     const inserted =
-      await sql`insert into public.professor_lessons(user_id,document_id,section_id,task_id,session_id,current_concept_id,phase,exam_mode,stages_json,mastery_questions_json,completed_stages_json,interactions_json,stage_checks_json,outline_version,provider,model,input_tokens,output_tokens) values(${userId},${item.document_id},${item.section_id},${item.id},${sessionId},${cleanStages[0]?.conceptId || null},'teach',${isNearExam(pref.exam_date)},${JSON.stringify({ title: value.title, objectives: value.objectives, conceptMap: value.conceptMap, stages: cleanStages, recap: value.recap })}::jsonb,${JSON.stringify(value.masteryQuestions)}::jsonb,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,3,${generated.provider},${generated.model},${generated.usage.input_tokens},${generated.usage.output_tokens}) on conflict(user_id,document_id,section_id) do nothing returning *`;
+      await sql`insert into public.professor_lessons(user_id,document_id,section_id,task_id,session_id,current_concept_id,phase,exam_mode,stages_json,mastery_questions_json,completed_stages_json,interactions_json,stage_checks_json,outline_version,provider,model,input_tokens,output_tokens) values(${userId},${item.document_id},${item.section_id},${item.id},${sessionId},${cleanStages[0]?.conceptId || null},'teach',${isNearExam(pref.exam_date)},${JSON.stringify({ title: value.title, objectives, conceptMap, stages: cleanStages, recap })}::jsonb,${JSON.stringify(masteryQuestions)}::jsonb,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,4,${generated.provider},${generated.model},${generated.usage.input_tokens},${generated.usage.output_tokens}) on conflict(user_id,document_id,section_id) do nothing returning *`;
     let saved =
       inserted[0] ||
       (
