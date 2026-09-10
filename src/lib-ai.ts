@@ -559,7 +559,12 @@ export class OpenRouterProvider implements AiProvider {
 }
 
 export function configuredOpenRouterProfessorProvider(metadata: { userId: string; documentId: string; requestId: string; sessionId: string; requestedTier?: string }, route: OpenRouterRoute) {
-  return scopedProvider("professor",metadata,[new OpenRouterProvider(route)]);
+  // Keep each approved model as a distinct gateway route. OpenRouter's `models`
+  // fallback only applies to upstream availability failures; a successful HTTP
+  // response containing invalid structured output must advance to the next
+  // approved model as well.
+  const providers = route.models.map((model) => new OpenRouterProvider({ ...route, models: [model] }));
+  return scopedProvider("professor",metadata,providers);
 }
 
 const health = new Map<string, { failures: number; unhealthyUntil: number }>();

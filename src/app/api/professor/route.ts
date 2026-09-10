@@ -294,7 +294,7 @@ export async function POST(request: Request) {
     const name = String(item.original_name);
     const session = await sql`insert into public.professor_sessions(user_id,document_id) values(${userId},${item.document_id}) returning id`;
     const sessionId=String(session[0].id);
-    const generated = await (await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${userId}:${item.document_id}:${item.section_id}:${item.index_version}`,tier:"economy" })).generate({
+    const generated = await (await professorProvider({ userId, documentId: String(item.document_id), sessionId, requestId: `professor-outline:${sessionId}:${item.index_version}`,tier:"economy" })).generate({
       mode: "tutor",
       schema: outlineSchema,
       allowedCitations: professorCitations(name, chunks),
