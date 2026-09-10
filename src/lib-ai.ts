@@ -526,6 +526,8 @@ export class OpenRouterProvider implements AiProvider {
     if (!this.model || !this.route.underlyingProviders.length) throw new AiProviderError("auth", "OpenRouter requires an approved model and provider pool", { provider: this.name });
     if (request.source.text === undefined) throw new AiProviderError("unknown", "Professor must send indexed text chunks, not whole files", { provider: this.name });
     const effectiveSchema = citationConstrainedSchema(request.schema, request.allowedCitations || []);
+    const tier = (request as GenerateAIRequest).requestedTier;
+    const reasoningEffort = tier === "advanced" ? "medium" : tier === "standard" ? "low" : "minimal";
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "http-referer": process.env.NEXT_PUBLIC_APP_URL?.trim() || "https://studyos-beryl.vercel.app", "x-openrouter-title": "StudyOS Professor" },
@@ -538,6 +540,7 @@ export class OpenRouterProvider implements AiProvider {
         ],
         response_format: { type: "json_schema", json_schema: { name: "studyos_professor", strict: true, schema: effectiveSchema } },
         plugins: [{ id: "response-healing" }],
+        reasoning: { effort: reasoningEffort },
         usage: { include: true },
         max_tokens: request.maxOutputTokens || 650,
         provider: { only: this.route.underlyingProviders, ignore: this.route.deniedProviders, allow_fallbacks: this.route.allowFallbacks, require_parameters: true, data_collection: "deny", zdr: this.route.requireZdr, sort: this.route.routingPreference, ...(this.route.maxCostPerRequestUsd>0?{max_price:{request:this.route.maxCostPerRequestUsd}}:{}) },
@@ -630,7 +633,9 @@ export function createAIGateway(options: GatewayOptions = {}) {
             failedUsage.other += billed.other_billable_tokens || 0;
             if (billed.actual_cost_usd !== undefined) { failedUsage.cost += billed.actual_cost_usd; failedUsage.costKnown = true; }
           }
-          if (!transientKinds.has(lastError.kind) || attempt === maxRetries) break;
+          // A schema-valid HTTP response will not become valid by repeating the
+          // same model. Move directly to the next approved model instead.
+          if (!transientKinds.has(lastError.kind) || lastError.kind === "structured_output" || attempt === maxRetries) break;
           retryCount += 1;
           const base = Math.min(lastError.options.retryAfterMs ?? 1_000 * 2 ** attempt, 8_000);
           await sleep(base);

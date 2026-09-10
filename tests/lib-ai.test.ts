@@ -211,7 +211,7 @@ test("invalid structured output is bounded then falls back", async () => {
   resetProviderHealthForTests(); let attempts = 0;
   const invalid = mockProvider("omniroute", async () => { attempts += 1; throw new StructuredOutputError("invalid JSON"); });
   const result = await createAIGateway({ providers: [invalid, mockProvider("gemini", async () => success("gemini"))] })({ ...gatewayRequest });
-  assert.equal(result.provider, "gemini"); assert.equal(attempts, 2);
+  assert.equal(result.provider, "gemini"); assert.equal(attempts, 1);
 });
 
 test("compression policy protects scientific source context", () => {
@@ -341,6 +341,7 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
     assert.equal(body.provider.zdr, true);
     assert.equal(body.provider.max_price.request, 0.02);
     assert.deepEqual(body.plugins, [{ id: "response-healing" }]);
+    assert.deepEqual(body.reasoning, { effort: "minimal" });
     assert.deepEqual(body.usage, { include: true });
     assert.equal(body.max_tokens, 300);
     assert.equal(result.usage.cached_input_tokens, 10);
@@ -352,7 +353,7 @@ test("OpenRouter Professor sends only the approved model/provider pool with stri
   }
 });
 
-test("OpenRouter malformed retries retain their billable usage in telemetry", async () => {
+test("OpenRouter malformed output is billed once without a wasteful same-model retry", async () => {
   process.env.OPENROUTER_ENABLED = "true";
   process.env.OPENROUTER_API_KEY = "test-only";
   process.env.AI_MAX_RETRIES = "1";
@@ -368,10 +369,10 @@ test("OpenRouter malformed retries retain their billable usage in telemetry", as
     const provider = new OpenRouterProvider({ models: ["vendor/cheap"], underlyingProviders: ["vendor-a"], deniedProviders: [], allowFallbacks: false, requireZdr: true, routingPreference: "price", maxCostPerRequestUsd: 0.02, sessionId: "session-1" });
     await assert.rejects(createAIGateway({ providers: [provider], persistTelemetry: async row => { rows.push(row); } })({ ...gatewayRequest, task: "professor", requestId: "billed-failure" }), (error: unknown) => error instanceof AiProviderError && error.kind === "structured_output");
     assert.equal(rows.length, 1);
-    assert.equal(rows[0].inputTokens, 40);
-    assert.equal(rows[0].cachedInputTokens, 10);
-    assert.equal(rows[0].outputTokens, 16);
-    assert.equal(rows[0].estimatedCost, 0.004);
+    assert.equal(rows[0].inputTokens, 20);
+    assert.equal(rows[0].cachedInputTokens, 5);
+    assert.equal(rows[0].outputTokens, 8);
+    assert.equal(rows[0].estimatedCost, 0.002);
     assert.equal(rows[0].costStatus, "known");
   } finally {
     globalThis.fetch = originalFetch;
